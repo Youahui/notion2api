@@ -80,7 +80,11 @@ func (h *Handler) Responses(c *gin.Context) {
 		handleOpenAIError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, result.Payload)
+	if stream, _ := body["stream"].(bool); stream {
+		h.streamResponse(c, result)
+	} else {
+		c.JSON(http.StatusOK, result.Payload)
+	}
 	_ = h.keys.RecordUsage(c.Request.Context(), service.UsageRecord{
 		APIKeyID:         apiKey.ID,
 		Method:           c.Request.Method,
@@ -131,9 +135,52 @@ func (h *Handler) streamChatCompletion(c *gin.Context, result service.Completion
 		},
 	}
 	encoded, _ := json.Marshal(chunk)
-	_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", encoded)
-	_, _ = fmt.Fprint(c.Writer, "data: [DONE]\n\n")
-	c.Writer.Flush()
+	writeSSE(c.Writer, "", encoded)
+	writeSSEDone(c.Writer)
+}
+
+func (h *Handler) streamResponse(c *gin.Context, result service.CompletionResult) {
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Status(http.StatusOK)
+
+	outputItemID := "msg-" + fmt.Sprint(result.Payload["id"])
+
+	if len(result.Text) > 0 {
+		delta, _ := json.Marshal(map[string]any{
+			"type":     "response.output_text.delta",
+			"item_id":  outputItemID,
+			"output_index": 0,
+			"content_index": 0,
+			"delta":    result.Text,
+		})
+		writeSSE(c.Writer, "response.output_text.delta", delta)
+	}
+
+	completed, _ := json.Marshal(map[string]any{
+		"type":     "response.completed",
+		"response": result.Payload,
+	})
+	writeSSE(c.Writer, "response.completed", completed)
+	writeSSEDone(c.Writer)
+}
+
+func writeSSE(w http.ResponseWriter, event string, payload []byte) {
+	if event != "" {
+		_, _ = fmt.Fprintf(w, "event: %s\n", event)
+	}
+	_, _ = fmt.Fprintf(w, "data: %s\n\n", payload)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func writeSSEDone(w http.ResponseWriter) {
+	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func handleOpenAIError(c *gin.Context, err error) {

@@ -193,11 +193,14 @@ func (s *OpenAIService) Response(ctx context.Context, body map[string]any) (Comp
 		TotalTokens:      promptTokens + completionTokens,
 		Estimated:        true,
 	}
+	createdAt := time.Now().Unix()
 	payload := map[string]any{
-		"id":      "resp-" + uuid.NewString(),
-		"object":  "response",
-		"created": time.Now().Unix(),
-		"model":   row.PublicID,
+		"id":         "resp-" + uuid.NewString(),
+		"object":     "response",
+		"created_at": createdAt,
+		"created":    createdAt,
+		"status":     "completed",
+		"model":      row.PublicID,
 		"output": []map[string]any{
 			{
 				"type": "message",
@@ -208,9 +211,17 @@ func (s *OpenAIService) Response(ctx context.Context, body map[string]any) (Comp
 			},
 		},
 		"usage": map[string]any{
+			"input_tokens":  usage.PromptTokens,
+			"output_tokens": usage.CompletionTokens,
+			"total_tokens":  usage.TotalTokens,
+			"input_tokens_details": map[string]any{
+				"cached_tokens": 0,
+			},
+			"output_tokens_details": map[string]any{
+				"reasoning_tokens": 0,
+			},
 			"prompt_tokens":     usage.PromptTokens,
 			"completion_tokens": usage.CompletionTokens,
-			"total_tokens":      usage.TotalTokens,
 			"estimated":         usage.Estimated,
 		},
 		"notion_trace": map[string]any{
