@@ -1,4 +1,4 @@
-FROM golang:1.22-alpine AS backend-build
+FROM golang:1.25-alpine AS backend-build
 
 WORKDIR /src/backend
 RUN apk add --no-cache build-base
@@ -15,5 +15,5 @@ COPY --from=backend-build /out/notaion2api ./notaion2api
 COPY backend/configs ./config
 RUN mkdir -p /app/data && chown -R notaion2api:notaion2api /app
 USER notaion2api
-EXPOSE 8787
+EXPOSE 9998
 CMD ["./notaion2api", "--config", "/app/config/config.docker.yaml"]

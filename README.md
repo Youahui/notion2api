@@ -95,7 +95,7 @@ VITE_API_BASE_URL=http://127.0.0.1:9998 pnpm dev
 
 ### 方式二：Docker Compose
 
-Docker 配置监听容器内 `8787`，默认映射到宿主机 `8787`。当前 Dockerfile 只构建后端服务，管理台如需使用请单独运行或部署 `frontend`。
+Docker 配置监听容器内 `9998`，默认映射到宿主机 `9998`。当前 Dockerfile 只构建后端服务，管理台如需使用请单独运行或部署 `frontend`。
 
 ```bash
 N2A_BOOTSTRAP_ADMIN_USERNAME=admin \
@@ -107,7 +107,7 @@ docker compose up -d --build
 检查服务：
 
 ```bash
-curl http://127.0.0.1:8787/healthz
+curl http://127.0.0.1:9998/healthz
 ```
 
 如果需要 PostgreSQL：
@@ -224,7 +224,7 @@ curl http://127.0.0.1:9998/v1/responses \
 
 | 配置项 | 本地开发示例 | Docker 示例 |
 | --- | --- | --- |
-| Base URL | `http://127.0.0.1:9998/v1` | `http://127.0.0.1:8787/v1` |
+| Base URL | `http://127.0.0.1:9998/v1` | `http://127.0.0.1:9998/v1` |
 | API Key | `<api_key>` | 你的 `N2A_BOOTSTRAP_API_KEY` 或管理台创建的 Key |
 | Model | `auto` | `auto` 或 `/v1/models` 返回的模型 ID |
 
@@ -405,7 +405,7 @@ pnpm build
 
 ### 管理台请求失败
 
-确认前端 `VITE_API_BASE_URL` 指向后端地址。本地示例配置是 `http://127.0.0.1:9998`，Docker 默认是 `http://127.0.0.1:8787`。
+确认前端 `VITE_API_BASE_URL` 指向后端地址。本地示例配置和 Docker 默认地址都是 `http://127.0.0.1:9998`。
 
 ### `/v1/*` 返回 401
 
