@@ -19,6 +19,21 @@ services:
       N2A_BOOTSTRAP_API_KEY: ${N2A_BOOTSTRAP_API_KEY:-}
     command: ["./notaion2api", "--config", "/app/config/config.yaml"]
 
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        VITE_API_BASE_URL: ${N2A_FRONTEND_API_BASE_URL:-/api}
+    container_name: notaion2api-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "${N2A_FRONTEND_PORT:-8080}:80"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+
   postgres:
     image: postgres:16-alpine
     profiles: ["postgres"]

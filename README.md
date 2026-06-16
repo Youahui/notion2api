@@ -95,7 +95,10 @@ VITE_API_BASE_URL=http://127.0.0.1:9998 pnpm dev
 
 ### 方式二：Docker Compose
 
-Docker 配置监听容器内 `9998`，默认映射到宿主机 `9998`。当前 Dockerfile 只构建后端服务，管理台如需使用请单独运行或部署 `frontend`。
+Docker Compose 默认同时启动后端和管理台前端：
+- 后端 API：宿主机 `9998` -> 容器 `9998`
+- 前端管理台：宿主机 `8080` -> Nginx 容器 `80`
+- 前端容器会把 `/api/*` 反向代理到后端 `backend:9998`
 
 ```bash
 N2A_BOOTSTRAP_ADMIN_USERNAME=admin \
@@ -108,6 +111,12 @@ docker compose up -d --build
 
 ```bash
 curl http://127.0.0.1:9998/healthz
+```
+
+打开管理台：
+
+```bash
+http://127.0.0.1:8080/admin
 ```
 
 如果需要 PostgreSQL：
