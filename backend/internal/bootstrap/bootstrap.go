@@ -62,6 +62,7 @@ func Run(ctx context.Context, configPath string) error {
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			return err
 		}
+		notion.Close()
 		err := <-errCh
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil

@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"net/http"
+	"sync/atomic"
 	"testing"
 
 	"notaion2api/backend/internal/config"
@@ -86,6 +88,67 @@ func TestManagerSeparatesClientsByAccountAndProxy(t *testing.T) {
 	if aliceClient == aliceOtherProxy {
 		t.Fatalf("expected different clients when account proxy changes")
 	}
+}
+
+func TestManagerEvictsStaleClientsForSameAccount(t *testing.T) {
+	manager := NewManager(30)
+	cfg := config.ProxyConfig{Mode: "http", URL: "http://127.0.0.1:7890"}
+	account := model.Account{ID: 1, Email: "alice@example.com", AuthToken: "token-a"}
+
+	first, err := manager.ClientForAccount(account, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	account.AuthToken = "token-b"
+	second, err := manager.ClientForAccount(account, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if first == second {
+		t.Fatalf("expected a new client after auth changes")
+	}
+	if got := len(manager.clients); got != 1 {
+		t.Fatalf("expected stale clients to be evicted, got %d cached clients", got)
+	}
+}
+
+func TestManagerCloseClosesIdleConnectionsAndClearsCache(t *testing.T) {
+	manager := &Manager{
+		timeout: 30,
+		clients: map[string]*http.Client{
+			"one": {Transport: &stubCloseIdleTransport{}},
+			"two": {Transport: &stubCloseIdleTransport{}},
+		},
+	}
+
+	transportOne := manager.clients["one"].Transport.(*stubCloseIdleTransport)
+	transportTwo := manager.clients["two"].Transport.(*stubCloseIdleTransport)
+
+	manager.Close()
+
+	if got := transportOne.closeCalls.Load(); got != 1 {
+		t.Fatalf("expected first transport CloseIdleConnections once, got %d", got)
+	}
+	if got := transportTwo.closeCalls.Load(); got != 1 {
+		t.Fatalf("expected second transport CloseIdleConnections once, got %d", got)
+	}
+	if got := len(manager.clients); got != 0 {
+		t.Fatalf("expected cache to be cleared, got %d entries", got)
+	}
+}
+
+type stubCloseIdleTransport struct {
+	closeCalls atomic.Int32
+}
+
+func (s *stubCloseIdleTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func (s *stubCloseIdleTransport) CloseIdleConnections() {
+	s.closeCalls.Add(1)
 }
 
 func TestParseURLAddsFallbackScheme(t *testing.T) {

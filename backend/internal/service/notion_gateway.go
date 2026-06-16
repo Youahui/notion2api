@@ -138,6 +138,13 @@ func (g *NotionGateway) clientForAccount(account model.Account) (*http.Client, e
 	return g.clients.ClientForAccount(account, g.cfg.Proxy)
 }
 
+func (g *NotionGateway) Close() {
+	if g == nil || g.clients == nil {
+		return
+	}
+	g.clients.Close()
+}
+
 func (g *NotionGateway) applyAccountHeaders(req *http.Request, account model.Account, accept string) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", accept)
