@@ -23,7 +23,7 @@ export function UsagePage() {
         dataSource={rows}
         columns={[
           { title: '日期', dataIndex: 'date' },
-          { title: 'API Key ID', dataIndex: 'api_key_id' },
+          { title: 'API 密钥 ID', dataIndex: 'api_key_id' },
           { title: '模型', dataIndex: 'model' },
           { title: '请求数', dataIndex: 'request_count' },
           { title: 'Prompt', dataIndex: 'prompt_tokens' },
@@ -35,4 +35,3 @@ export function UsagePage() {
     </>
   );
 }
-

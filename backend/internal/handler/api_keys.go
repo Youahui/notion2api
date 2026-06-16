@@ -24,7 +24,7 @@ func (h *Handler) APIKeysList(c *gin.Context) {
 func (h *Handler) APIKeysCreate(c *gin.Context) {
 	var req dto.CreateAPIKeyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		respond.BadRequest(c, "invalid api key payload")
+		respond.BadRequest(c, "invalid API 密钥 payload")
 		return
 	}
 	admin, _ := requestctx.AdminUser(c)
@@ -56,7 +56,7 @@ func (h *Handler) APIKeysUpdate(c *gin.Context) {
 	}
 	var req dto.UpdateAPIKeyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		respond.BadRequest(c, "invalid api key payload")
+		respond.BadRequest(c, "invalid API 密钥 payload")
 		return
 	}
 	row, err := h.keys.Update(c.Request.Context(), id, req)

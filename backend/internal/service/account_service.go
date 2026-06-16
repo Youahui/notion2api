@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"notaion2api/backend/internal/config"
 	"notaion2api/backend/internal/dto"
 	"notaion2api/backend/internal/model"
 	"notaion2api/backend/internal/repository"
@@ -14,11 +15,13 @@ import (
 )
 
 type AccountService struct {
-	store *repository.Store
+	store      *repository.Store
+	cfg        config.Config
+	probeCache *dispatchProbeCache
 }
 
-func NewAccountService(store *repository.Store) *AccountService {
-	return &AccountService{store: store}
+func NewAccountService(store *repository.Store, cfg config.Config) *AccountService {
+	return &AccountService{store: store, cfg: cfg, probeCache: newDispatchProbeCache()}
 }
 
 func (s *AccountService) List(ctx context.Context, includeDisabled bool) ([]dto.AccountDTO, error) {
@@ -90,13 +93,19 @@ func (s *AccountService) Update(ctx context.Context, id uint, req dto.UpsertAcco
 }
 
 func (s *AccountService) Delete(ctx context.Context, id uint) error {
-	if _, err := s.store.GetAccount(ctx, id); err != nil {
+	account, err := s.store.GetAccount(ctx, id)
+	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return ErrNotFound
 		}
 		return err
 	}
-	return s.store.DeleteAccount(ctx, id)
+	if err := s.store.DeleteAccount(ctx, id); err != nil {
+		return err
+	}
+	_ = s.store.DeleteLoginSession(ctx, account.Email)
+	s.removeAccountSessionFiles(account)
+	return nil
 }
 
 func (s *AccountService) Activate(ctx context.Context, id uint) (dto.AccountDTO, error) {
@@ -148,6 +157,32 @@ func (s *AccountService) MarkSuccess(ctx context.Context, id uint) {
 
 func (s *AccountService) MarkFailure(ctx context.Context, id uint, message string) {
 	_ = s.store.MarkAccountFailure(ctx, id, trimError(message), time.Now())
+	if account, err := s.store.GetAccount(ctx, id); err == nil {
+		s.probeCache.markFailure(account.Email)
+	}
+}
+
+func (s *AccountService) ProbeProtocolHealth(ctx context.Context, gateway *NotionGateway, account model.Account) error {
+	if gateway == nil {
+		return nil
+	}
+	now := time.Now()
+	ttl := time.Duration(s.cfg.Dispatch.ProbeCacheTTLSeconds) * time.Second
+	if !s.probeCache.shouldProbe(account.Email, ttl, now) {
+		return nil
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, dispatchProbeTimeout(s.cfg))
+	defer cancel()
+	if err := gateway.ProbeProtocolHealth(probeCtx, account); err != nil {
+		if probeCtx.Err() != nil {
+			s.probeCache.markSuccess(account.Email, now)
+			return nil
+		}
+		s.probeCache.markFailure(account.Email)
+		return err
+	}
+	s.probeCache.markSuccess(account.Email, now)
+	return nil
 }
 
 func accountFromRequest(req dto.UpsertAccountRequest, existing model.Account) (model.Account, error) {
@@ -182,11 +217,17 @@ func accountFromRequest(req dto.UpsertAccountRequest, existing model.Account) (m
 	if clean := strings.TrimSpace(req.ClientVersion); clean != "" {
 		existing.ClientVersion = clean
 	}
+	if clean := strings.TrimSpace(req.PlanType); clean != "" {
+		existing.PlanType = clean
+	}
 	if clean := strings.TrimSpace(req.Status); clean != "" {
 		existing.Status = clean
 	}
 	if req.Priority != 0 {
 		existing.Priority = req.Priority
+	}
+	if req.HourlyQuota >= 0 {
+		existing.HourlyQuota = req.HourlyQuota
 	}
 	if req.MaxConcurrency > 0 {
 		existing.MaxConcurrency = req.MaxConcurrency
@@ -198,6 +239,15 @@ func accountFromRequest(req dto.UpsertAccountRequest, existing model.Account) (m
 	existing.ProxyHTTPURL = strings.TrimSpace(req.ProxyHTTPURL)
 	existing.ProxyHTTPSURL = strings.TrimSpace(req.ProxyHTTPSURL)
 	existing.ProbeJSON = strings.TrimSpace(req.ProbeJSON)
+	if clean := strings.TrimSpace(req.ProfileDir); clean != "" {
+		existing.ProfileDir = clean
+	}
+	if clean := strings.TrimSpace(req.StorageStatePath); clean != "" {
+		existing.StorageStatePath = clean
+	}
+	if clean := strings.TrimSpace(req.PendingStatePath); clean != "" {
+		existing.PendingStatePath = clean
+	}
 	if req.ClearAuthToken {
 		existing.AuthToken = ""
 	} else if clean := strings.TrimSpace(req.AuthToken); clean != "" {
@@ -226,14 +276,23 @@ func AccountDTO(account model.Account) dto.AccountDTO {
 		SpaceViewID:         account.SpaceViewID,
 		SpaceName:           account.SpaceName,
 		ClientVersion:       account.ClientVersion,
+		PlanType:            account.PlanType,
 		Status:              account.Status,
 		Priority:            account.Priority,
+		HourlyQuota:         account.HourlyQuota,
+		WindowStartedAt:     account.WindowStartedAt,
+		WindowRequestCount:  account.WindowRequestCount,
+		CooldownUntil:       account.CooldownUntil,
 		MaxConcurrency:      account.MaxConcurrency,
 		ProxyMode:           account.ProxyMode,
 		ProxyURL:            account.ProxyURL,
 		ProxyHTTPURL:        account.ProxyHTTPURL,
 		ProxyHTTPSURL:       account.ProxyHTTPSURL,
 		ProbeJSON:           account.ProbeJSON,
+		ProfileDir:          account.ProfileDir,
+		StorageStatePath:    account.StorageStatePath,
+		PendingStatePath:    account.PendingStatePath,
+		LoginMessage:        account.LoginMessage,
 		HasAuthToken:        strings.TrimSpace(account.AuthToken) != "",
 		HasCookie:           strings.TrimSpace(account.Cookie) != "",
 		LastError:           account.LastError,

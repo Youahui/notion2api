@@ -32,3 +32,223 @@ body {
   color: #667085;
 }
 
+.account-list-item {
+  width: 100%;
+  border: 1px solid #d9e2ef;
+  border-radius: 12px;
+  background: #fff;
+  padding: 14px 16px;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
+}
+
+.account-list-item:hover {
+  border-color: #9db7f5;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.08);
+}
+
+.account-list-item-active {
+  border-color: #2563eb;
+  background: #f3f7ff;
+}
+
+.accounts-page {
+  width: 100%;
+  max-width: 1280px;
+  margin: 0 auto;
+}
+
+.accounts-page .ant-card {
+  border-radius: 12px;
+}
+
+.accounts-title {
+  margin: 4px 0 0 !important;
+  font-size: 24px !important;
+  line-height: 32px !important;
+}
+
+.accounts-overview-card .ant-statistic-title {
+  margin-bottom: 4px;
+}
+
+.accounts-stat-grid {
+  flex: 1;
+  min-width: 0;
+}
+
+.accounts-overview-actions {
+  margin-left: auto;
+}
+
+.accounts-card-list {
+  width: 100%;
+  max-height: calc(100vh - 330px);
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.accounts-list-pagination {
+  display: flex;
+  justify-content: center;
+  margin-top: 16px;
+}
+
+.accounts-list-pagination .ant-pagination-total-text {
+  flex-basis: 100%;
+  text-align: center;
+}
+
+.accounts-fill-card {
+  height: 100%;
+}
+
+.accounts-step-label {
+  color: #667085;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.accounts-narrow-form .ant-input,
+.accounts-narrow-form .ant-input-affix-wrapper,
+.accounts-narrow-form .ant-select,
+.accounts-narrow-form .ant-input-number,
+.accounts-detail-form .ant-input,
+.accounts-detail-form .ant-select,
+.accounts-detail-form .ant-input-number,
+.accounts-manual-form .ant-input,
+.accounts-manual-form .ant-input-affix-wrapper,
+.accounts-manual-form .ant-input-number {
+  max-width: 520px;
+}
+
+.accounts-detail-form textarea.ant-input,
+.accounts-manual-form textarea.ant-input,
+.accounts-code-input {
+  max-width: 760px;
+}
+
+.accounts-code-input {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+.conversations-page {
+  width: 100%;
+  max-width: 1320px;
+  margin: 0 auto;
+}
+
+.conversations-page .ant-card {
+  border-radius: 12px;
+}
+
+.conversations-toolbar-card {
+  margin-bottom: 16px;
+}
+
+.conversations-select {
+  min-width: 280px;
+}
+
+.conversations-alert,
+.conversations-overview {
+  margin-bottom: 16px;
+}
+
+.conversations-fill-card {
+  height: 100%;
+}
+
+.conversations-list-row {
+  padding: 0 !important;
+  border-block-end: 0 !important;
+}
+
+.conversation-list-item {
+  width: 100%;
+  margin-bottom: 10px;
+  border: 1px solid #d9e2ef;
+  border-radius: 10px;
+  background: #fff;
+  padding: 14px;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
+}
+
+.conversation-list-item:hover {
+  border-color: #9db7f5;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.08);
+}
+
+.conversation-list-item-active {
+  border-color: #2563eb;
+  background: #f3f7ff;
+}
+
+.conversation-list-title {
+  min-width: 0;
+  color: #111827;
+  font-weight: 600;
+  line-height: 22px;
+  overflow-wrap: anywhere;
+}
+
+.conversation-list-meta {
+  margin-top: 10px;
+  font-size: 12px;
+}
+
+.conversations-detail-stack {
+  width: 100%;
+}
+
+.conversation-message-list {
+  display: flex;
+  max-height: calc(100vh - 430px);
+  min-height: 280px;
+  flex-direction: column;
+  gap: 12px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.conversation-message {
+  border: 1px solid #e4e7ec;
+  border-radius: 10px;
+  background: #fff;
+  padding: 14px;
+}
+
+.conversation-message-user {
+  border-color: #bfdbfe;
+  background: #f8fbff;
+}
+
+.conversation-message-content {
+  margin-top: 10px;
+  border-radius: 8px;
+  background: #f8fafc;
+  padding: 12px;
+  color: #101828;
+  font-size: 14px;
+  line-height: 24px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.conversation-attachments {
+  margin-top: 10px;
+}
+
+@media (max-width: 640px) {
+  .conversations-select {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .conversation-message-list {
+    max-height: none;
+  }
+}

@@ -21,8 +21,11 @@ export function LogsPage() {
       <Table
         rowKey="id"
         dataSource={rows}
+        scroll={{ x: 1100 }}
         columns={[
           { title: '时间', dataIndex: 'created_at', render: (value: string) => new Date(value).toLocaleString() },
+          { title: 'APIKey 名称', dataIndex: 'api_key_name', render: (value: string) => value || '-' },
+          { title: 'APIKey', dataIndex: 'api_key_masked', render: (value: string) => value || '-' },
           { title: '方法', dataIndex: 'method' },
           { title: '路由', dataIndex: 'route' },
           { title: '状态', dataIndex: 'status_code', render: (value: number) => <Tag color={value < 400 ? 'green' : 'red'}>{value}</Tag> },
@@ -35,4 +38,3 @@ export function LogsPage() {
     </>
   );
 }
-

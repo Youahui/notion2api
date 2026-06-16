@@ -37,9 +37,9 @@ func APIKeyAuth(keys *service.APIKeyService) gin.HandlerFunc {
 		if err != nil {
 			switch {
 			case errors.Is(err, service.ErrForbidden):
-				respond.Error(c, http.StatusForbidden, "api key is disabled, expired, or quota exhausted")
+				respond.Error(c, http.StatusForbidden, "API 密钥已禁用、已过期或额度耗尽")
 			case errors.Is(err, service.ErrUnauthorized):
-				respond.Unauthorized(c, "valid api key required")
+				respond.Unauthorized(c, "需要有效的 API 密钥")
 			default:
 				respond.Internal(c)
 			}

@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
@@ -110,6 +111,15 @@ func (s *Store) FindAPIKeysByPrefix(ctx context.Context, prefix string) ([]model
 	return keys, err
 }
 
+func (s *Store) FindAPIKeysByIDs(ctx context.Context, ids []uint) ([]model.APIKey, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var keys []model.APIKey
+	err := s.db.WithContext(ctx).Unscoped().Where("id IN ?", ids).Find(&keys).Error
+	return keys, err
+}
+
 func (s *Store) SaveAPIKey(ctx context.Context, key *model.APIKey) error {
 	return s.db.WithContext(ctx).Save(key).Error
 }
@@ -196,7 +206,15 @@ func (s *Store) UpsertModel(ctx context.Context, row model.Model) error {
 	var existing model.Model
 	return s.db.WithContext(ctx).
 		Where(model.Model{PublicID: row.PublicID}).
-		Assign(row).
+		Assign(map[string]any{
+			"name":         row.Name,
+			"notion_model": row.NotionModel,
+			"family":       row.Family,
+			"group":        row.Group,
+			"beta":         row.Beta,
+			"enabled":      row.Enabled,
+			"aliases":      row.Aliases,
+		}).
 		FirstOrCreate(&existing).Error
 }
 
@@ -310,4 +328,34 @@ func (s *Store) MarkAccountFailure(ctx context.Context, id uint, message string,
 		"consecutive_failures": gorm.Expr("consecutive_failures + ?", 1),
 		"total_failures":       gorm.Expr("total_failures + ?", 1),
 	}).Error
+}
+
+func (s *Store) UpsertLoginSession(ctx context.Context, session *model.AccountLoginSession) error {
+	var existing model.AccountLoginSession
+	err := s.db.WithContext(ctx).Where("email = ?", session.Email).First(&existing).Error
+	if err == nil {
+		session.ID = existing.ID
+		session.CreatedAt = existing.CreatedAt
+		return s.db.WithContext(ctx).Save(session).Error
+	}
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	return s.db.WithContext(ctx).Create(session).Error
+}
+
+func (s *Store) GetLoginSession(ctx context.Context, email string) (model.AccountLoginSession, error) {
+	var session model.AccountLoginSession
+	err := s.db.WithContext(ctx).Where("email = ?", email).First(&session).Error
+	return session, err
+}
+
+func (s *Store) DeleteLoginSession(ctx context.Context, email string) error {
+	return s.db.WithContext(ctx).Where("email = ?", email).Delete(&model.AccountLoginSession{}).Error
+}
+
+func (s *Store) ListLoginSessions(ctx context.Context) ([]model.AccountLoginSession, error) {
+	var sessions []model.AccountLoginSession
+	err := s.db.WithContext(ctx).Order("updated_at desc, id desc").Find(&sessions).Error
+	return sessions, err
 }

@@ -15,6 +15,9 @@ export function AdminLayout() {
 
   const selectedKeys = useMemo(() => {
     const parts = location.pathname.split('/').filter(Boolean);
+    if (parts[1] === 'accounts') {
+      return [`accounts-${parts[2] ?? 'list'}`];
+    }
     return [parts[1] ?? 'dashboard'];
   }, [location.pathname]);
 
@@ -32,13 +35,24 @@ export function AdminLayout() {
           theme="dark"
           mode="inline"
           selectedKeys={selectedKeys}
+          defaultOpenKeys={location.pathname.startsWith('/admin/accounts') ? ['accounts'] : []}
           items={[
             { key: 'dashboard', icon: <DashboardOutlined />, label: <Link to="/admin">仪表盘</Link> },
             { key: 'admins', icon: <TeamOutlined />, label: <Link to="/admin/admins">管理员</Link> },
-            { key: 'api-keys', icon: <KeyOutlined />, label: <Link to="/admin/api-keys">API Key</Link> },
+            { key: 'api-keys', icon: <KeyOutlined />, label: <Link to="/admin/api-keys">API 密钥</Link> },
             { key: 'usage', icon: <BarChartOutlined />, label: <Link to="/admin/usage">用量</Link> },
             { key: 'models', icon: <RobotOutlined />, label: <Link to="/admin/models">模型</Link> },
-            { key: 'accounts', icon: <DatabaseOutlined />, label: <Link to="/admin/accounts">账号池</Link> },
+            {
+              key: 'accounts',
+              icon: <DatabaseOutlined />,
+              label: '账号池',
+              children: [
+                { key: 'accounts-list', label: <Link to="/admin/accounts/list">账号列表</Link> },
+                { key: 'accounts-add', label: <Link to="/admin/accounts/add">添加账号</Link> },
+                { key: 'accounts-test', label: <Link to="/admin/accounts/test">测试账号</Link> },
+                { key: 'accounts-logs', label: <Link to="/admin/accounts/logs">运行日志</Link> }
+              ]
+            },
             { key: 'conversations', icon: <ApiOutlined />, label: <Link to="/admin/conversations">会话</Link> },
             { key: 'tester', icon: <ApiOutlined />, label: <Link to="/admin/tester">测试台</Link> },
             { key: 'logs', icon: <UnorderedListOutlined />, label: <Link to="/admin/logs">日志</Link> },

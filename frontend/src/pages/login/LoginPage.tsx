@@ -1,11 +1,20 @@
 import { LockOutlined, UserOutlined } from '@ant-design/icons';
 import { Button, Card, Form, Input, Typography, App as AntApp } from 'antd';
-import { useNavigate } from 'react-router-dom';
+import { useMemo } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { adminApi } from '../../services/adminApi';
 
 export function LoginPage() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const { message } = AntApp.useApp();
+  const redirectTo = useMemo(() => {
+    const value = searchParams.get('redirect');
+    if (!value || !value.startsWith('/admin') || value.startsWith('/admin/login')) {
+      return '/admin';
+    }
+    return value;
+  }, [searchParams]);
 
   return (
     <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', background: '#f6f8fb', padding: 24 }}>
@@ -20,7 +29,7 @@ export function LoginPage() {
             try {
               await adminApi.login(values.username, values.password);
               message.success('登录成功');
-              navigate('/admin', { replace: true });
+              navigate(redirectTo, { replace: true });
             } catch (error) {
               message.error(error instanceof Error ? error.message : '登录失败');
             }
@@ -40,4 +49,3 @@ export function LoginPage() {
     </div>
   );
 }
-

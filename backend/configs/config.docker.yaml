@@ -8,6 +8,7 @@ security:
     username: admin
     password: change-me
   bootstrap_api_key: ""
+  api_key_prefix: "n2a"
 
 database:
   driver: sqlite
@@ -34,9 +35,24 @@ features:
   generate_image: true
   csv_attachment: true
   fresh_thread_per_request: true
+  preserve_system_messages_as_steps: false
+
+dispatch:
+  probe_cache_ttl_seconds: 60
+
+sticky:
+  enabled: true
+  ttl_seconds: 604800
+  local_enabled: true
+  redis_url: ""
+  redis_key_prefix: "n2a:sticky:thread:"
+  redis_timeout_seconds: 2
 
 storage:
   persist_conversations: true
   persist_responses: true
   response_ttl_seconds: 3600
 
+login_helper:
+  sessions_dir: /app/data/notion_accounts
+  timeout_sec: 120

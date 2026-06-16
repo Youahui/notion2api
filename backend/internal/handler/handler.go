@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"notaion2api/backend/internal/config"
 	"notaion2api/backend/internal/pkg/respond"
@@ -20,11 +21,12 @@ type Handler struct {
 	models   *service.ModelService
 	accounts *service.AccountService
 	openai   *service.OpenAIService
+	notion   *service.NotionGateway
 	storeDB  *gorm.DB
 }
 
-func New(cfg config.Config, admins *service.AdminService, keys *service.APIKeyService, models *service.ModelService, accounts *service.AccountService, openai *service.OpenAIService, db *gorm.DB) *Handler {
-	return &Handler{cfg: cfg, admins: admins, keys: keys, models: models, accounts: accounts, openai: openai, storeDB: db}
+func New(cfg config.Config, admins *service.AdminService, keys *service.APIKeyService, models *service.ModelService, accounts *service.AccountService, openai *service.OpenAIService, notion *service.NotionGateway, db *gorm.DB) *Handler {
+	return &Handler{cfg: cfg, admins: admins, keys: keys, models: models, accounts: accounts, openai: openai, notion: notion, storeDB: db}
 }
 
 func (h *Handler) Health(c *gin.Context) {
@@ -57,7 +59,7 @@ func parseID(c *gin.Context) (uint, bool) {
 func handleServiceError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, service.ErrInvalid):
-		respond.BadRequest(c, "invalid request")
+		respond.BadRequest(c, serviceErrorDetail(err, "invalid request"))
 	case errors.Is(err, service.ErrUnauthorized):
 		respond.Unauthorized(c, "unauthorized")
 	case errors.Is(err, service.ErrForbidden):
@@ -69,4 +71,18 @@ func handleServiceError(c *gin.Context, err error) {
 	default:
 		respond.Internal(c)
 	}
+}
+
+func serviceErrorDetail(err error, fallback string) string {
+	detail := strings.TrimSpace(err.Error())
+	if detail == "" || detail == service.ErrInvalid.Error() || detail == service.ErrConflict.Error() {
+		return fallback
+	}
+	for _, prefix := range []string{
+		service.ErrInvalid.Error() + ": ",
+		service.ErrConflict.Error() + ": ",
+	} {
+		detail = strings.TrimPrefix(detail, prefix)
+	}
+	return detail
 }

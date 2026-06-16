@@ -39,6 +39,7 @@ type UpdateAdminRequest struct {
 type APIKeyDTO struct {
 	ID              uint       `json:"id"`
 	Name            string     `json:"name"`
+	APIKey          string     `json:"api_key"`
 	KeyPrefix       string     `json:"key_prefix"`
 	KeySuffix       string     `json:"key_suffix"`
 	Enabled         bool       `json:"enabled"`
@@ -90,6 +91,7 @@ type ChatCompletionRequest struct {
 	AccountEmail       string        `json:"account_email"`
 	NotionAccountEmail string        `json:"notion_account_email"`
 	UseWebSearch       *bool         `json:"use_web_search"`
+	ResponseFormat     any           `json:"response_format"`
 	Metadata           any           `json:"metadata"`
 	Tools              any           `json:"tools"`
 	Attachments        any           `json:"attachments"`
@@ -100,6 +102,24 @@ type UsageDTO struct {
 	CompletionTokens int64 `json:"completion_tokens"`
 	TotalTokens      int64 `json:"total_tokens"`
 	Estimated        bool  `json:"estimated"`
+}
+
+type RequestLogDTO struct {
+	ID               uint       `json:"id"`
+	APIKeyID         *uint      `json:"api_key_id,omitempty"`
+	APIKeyName       string     `json:"api_key_name,omitempty"`
+	APIKeyMasked     string     `json:"api_key_masked,omitempty"`
+	Method           string     `json:"method"`
+	Route            string     `json:"route"`
+	StatusCode       int        `json:"status_code"`
+	LatencyMs        int64      `json:"latency_ms"`
+	Model            string     `json:"model"`
+	PromptTokens     int64      `json:"prompt_tokens"`
+	CompletionTokens int64      `json:"completion_tokens"`
+	TotalTokens      int64      `json:"total_tokens"`
+	Estimated        bool       `json:"estimated"`
+	ErrorSummary     string     `json:"error_summary"`
+	CreatedAt        *time.Time `json:"created_at,omitempty"`
 }
 
 type ModelDTO struct {
@@ -125,14 +145,23 @@ type AccountDTO struct {
 	SpaceViewID         string     `json:"space_view_id"`
 	SpaceName           string     `json:"space_name"`
 	ClientVersion       string     `json:"client_version"`
+	PlanType            string     `json:"plan_type"`
 	Status              string     `json:"status"`
 	Priority            int        `json:"priority"`
+	HourlyQuota         int        `json:"hourly_quota"`
+	WindowStartedAt     *time.Time `json:"window_started_at"`
+	WindowRequestCount  int        `json:"window_request_count"`
+	CooldownUntil       *time.Time `json:"cooldown_until"`
 	MaxConcurrency      int        `json:"max_concurrency"`
 	ProxyMode           string     `json:"proxy_mode"`
 	ProxyURL            string     `json:"proxy_url"`
 	ProxyHTTPURL        string     `json:"proxy_http_url"`
 	ProxyHTTPSURL       string     `json:"proxy_https_url"`
 	ProbeJSON           string     `json:"probe_json"`
+	ProfileDir          string     `json:"profile_dir"`
+	StorageStatePath    string     `json:"storage_state_path"`
+	PendingStatePath    string     `json:"pending_state_path"`
+	LoginMessage        string     `json:"login_message"`
 	HasAuthToken        bool       `json:"has_auth_token"`
 	HasCookie           bool       `json:"has_cookie"`
 	LastError           string     `json:"last_error"`
@@ -147,28 +176,46 @@ type AccountDTO struct {
 	UpdatedAt           time.Time  `json:"updated_at"`
 }
 
-type UpsertAccountRequest struct {
-	Email          string `json:"email" binding:"required"`
-	Enabled        *bool  `json:"enabled"`
-	Active         *bool  `json:"active"`
-	UserID         string `json:"user_id"`
-	UserName       string `json:"user_name"`
+type AccountSpaceDTO struct {
+	ID             string `json:"id"`
 	SpaceID        string `json:"space_id"`
 	SpaceViewID    string `json:"space_view_id"`
-	SpaceName      string `json:"space_name"`
-	ClientVersion  string `json:"client_version"`
-	Status         string `json:"status"`
-	Priority       int    `json:"priority"`
-	MaxConcurrency int    `json:"max_concurrency"`
-	ProxyMode      string `json:"proxy_mode"`
-	ProxyURL       string `json:"proxy_url"`
-	ProxyHTTPURL   string `json:"proxy_http_url"`
-	ProxyHTTPSURL  string `json:"proxy_https_url"`
-	AuthToken      string `json:"auth_token"`
-	Cookie         string `json:"cookie"`
-	ProbeJSON      string `json:"probe_json"`
-	ClearAuthToken bool   `json:"clear_auth_token"`
-	ClearCookie    bool   `json:"clear_cookie"`
+	Name           string `json:"name"`
+	PlanType       string `json:"plan_type"`
+	MembershipType string `json:"membership_type"`
+	Role           string `json:"role"`
+	Domain         string `json:"domain"`
+	Region         string `json:"region"`
+	Current        bool   `json:"current"`
+}
+
+type UpsertAccountRequest struct {
+	Email            string `json:"email" binding:"required"`
+	Enabled          *bool  `json:"enabled"`
+	Active           *bool  `json:"active"`
+	UserID           string `json:"user_id"`
+	UserName         string `json:"user_name"`
+	SpaceID          string `json:"space_id"`
+	SpaceViewID      string `json:"space_view_id"`
+	SpaceName        string `json:"space_name"`
+	ClientVersion    string `json:"client_version"`
+	PlanType         string `json:"plan_type"`
+	Status           string `json:"status"`
+	Priority         int    `json:"priority"`
+	HourlyQuota      int    `json:"hourly_quota"`
+	MaxConcurrency   int    `json:"max_concurrency"`
+	ProxyMode        string `json:"proxy_mode"`
+	ProxyURL         string `json:"proxy_url"`
+	ProxyHTTPURL     string `json:"proxy_http_url"`
+	ProxyHTTPSURL    string `json:"proxy_https_url"`
+	ProfileDir       string `json:"profile_dir"`
+	StorageStatePath string `json:"storage_state_path"`
+	PendingStatePath string `json:"pending_state_path"`
+	AuthToken        string `json:"auth_token"`
+	Cookie           string `json:"cookie"`
+	ProbeJSON        string `json:"probe_json"`
+	ClearAuthToken   bool   `json:"clear_auth_token"`
+	ClearCookie      bool   `json:"clear_cookie"`
 }
 
 type AccountTestRequest struct {
@@ -181,4 +228,98 @@ type AccountTestResponse struct {
 	Account       AccountDTO     `json:"account"`
 	NotionRequest map[string]any `json:"notion_request"`
 	Text          string         `json:"text"`
+}
+
+type ManualImportAccountRequest struct {
+	Email          string `json:"email"`
+	UserID         string `json:"user_id"`
+	UserName       string `json:"user_name"`
+	SpaceID        string `json:"space_id"`
+	SpaceViewID    string `json:"space_view_id"`
+	SpaceName      string `json:"space_name"`
+	ClientVersion  string `json:"client_version"`
+	CookieHeader   string `json:"cookie_header"`
+	TokenV2        string `json:"token_v2"`
+	ProbeJSONText  string `json:"probe_json_text"`
+	Active         bool   `json:"active"`
+	Priority       int    `json:"priority"`
+	HourlyQuota    int    `json:"hourly_quota"`
+	MaxConcurrency int    `json:"max_concurrency"`
+}
+
+type AccountLoginStartRequest struct {
+	Email string `json:"email" binding:"required"`
+}
+
+type AccountLoginVerifyRequest struct {
+	Email string `json:"email" binding:"required"`
+	Code  string `json:"code" binding:"required"`
+}
+
+type AccountLoginStatusDTO struct {
+	ID               uint       `json:"id"`
+	Email            string     `json:"email"`
+	Status           string     `json:"status"`
+	Success          bool       `json:"success"`
+	Message          string     `json:"message"`
+	Error            string     `json:"error"`
+	ClientVersion    string     `json:"client_version"`
+	DeviceID         string     `json:"device_id"`
+	ProfileDir       string     `json:"profile_dir"`
+	StorageStatePath string     `json:"storage_state_path"`
+	PendingStatePath string     `json:"pending_state_path"`
+	ProbePath        string     `json:"probe_path"`
+	CurrentURL       string     `json:"current_url"`
+	FinalURL         string     `json:"final_url"`
+	Title            string     `json:"title"`
+	LastLoginAt      *time.Time `json:"last_login_at"`
+	ExpiresAt        *time.Time `json:"expires_at"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
+}
+
+type AccountLoginResponse struct {
+	Success bool                  `json:"success"`
+	Account AccountDTO            `json:"account"`
+	Status  AccountLoginStatusDTO `json:"status"`
+}
+
+type NotionConversationAttachmentDTO struct {
+	Name        string `json:"name,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
+	Source      string `json:"source,omitempty"`
+	URL         string `json:"url,omitempty"`
+}
+
+type NotionConversationMessageDTO struct {
+	ID          string                            `json:"id"`
+	Role        string                            `json:"role"`
+	Status      string                            `json:"status"`
+	Content     string                            `json:"content"`
+	CreatedAt   *time.Time                        `json:"created_at,omitempty"`
+	UpdatedAt   *time.Time                        `json:"updated_at,omitempty"`
+	Attachments []NotionConversationAttachmentDTO `json:"attachments,omitempty"`
+}
+
+type NotionConversationSummaryDTO struct {
+	ID                   string     `json:"id"`
+	Title                string     `json:"title"`
+	Origin               string     `json:"origin"`
+	RemoteOnly           bool       `json:"remote_only"`
+	Preview              string     `json:"preview,omitempty"`
+	Status               string     `json:"status"`
+	Source               string     `json:"source"`
+	Transport            string     `json:"transport"`
+	AccountEmail         string     `json:"account_email"`
+	SpaceID              string     `json:"space_id"`
+	ThreadID             string     `json:"thread_id"`
+	CreatedByDisplayName string     `json:"created_by_display_name,omitempty"`
+	CreatedAt            *time.Time `json:"created_at,omitempty"`
+	UpdatedAt            *time.Time `json:"updated_at,omitempty"`
+	MessageCount         int        `json:"message_count,omitempty"`
+}
+
+type NotionConversationDetailDTO struct {
+	NotionConversationSummaryDTO
+	Messages []NotionConversationMessageDTO `json:"messages"`
 }

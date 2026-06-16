@@ -34,6 +34,7 @@ type APIKey struct {
 	ID              uint           `json:"id" gorm:"primaryKey"`
 	Name            string         `json:"name" gorm:"size:120;not null"`
 	KeyHash         string         `json:"-" gorm:"size:128;uniqueIndex;not null"`
+	APIKey          string         `json:"api_key" gorm:"type:text"`
 	KeyPrefix       string         `json:"key_prefix" gorm:"size:32;index;not null"`
 	KeySuffix       string         `json:"key_suffix" gorm:"size:16;not null"`
 	Enabled         bool           `json:"enabled" gorm:"not null;default:true"`
@@ -74,8 +75,13 @@ type Account struct {
 	SpaceViewID         string         `json:"space_view_id" gorm:"size:120"`
 	SpaceName           string         `json:"space_name" gorm:"size:255"`
 	ClientVersion       string         `json:"client_version" gorm:"size:80"`
+	PlanType            string         `json:"plan_type" gorm:"size:80"`
 	Status              string         `json:"status" gorm:"size:32;index;not null;default:inactive"`
 	Priority            int            `json:"priority" gorm:"not null;default:0"`
+	HourlyQuota         int            `json:"hourly_quota" gorm:"not null;default:0"`
+	WindowStartedAt     *time.Time     `json:"window_started_at"`
+	WindowRequestCount  int            `json:"window_request_count" gorm:"not null;default:0"`
+	CooldownUntil       *time.Time     `json:"cooldown_until"`
 	MaxConcurrency      int            `json:"max_concurrency" gorm:"not null;default:1"`
 	ProxyMode           string         `json:"proxy_mode" gorm:"size:32"`
 	ProxyURL            string         `json:"proxy_url" gorm:"size:512"`
@@ -84,6 +90,10 @@ type Account struct {
 	AuthToken           string         `json:"-" gorm:"type:text"`
 	Cookie              string         `json:"-" gorm:"type:text"`
 	ProbeJSON           string         `json:"probe_json" gorm:"type:text"`
+	ProfileDir          string         `json:"profile_dir" gorm:"type:text"`
+	StorageStatePath    string         `json:"storage_state_path" gorm:"type:text"`
+	PendingStatePath    string         `json:"pending_state_path" gorm:"type:text"`
+	LoginMessage        string         `json:"login_message" gorm:"size:512"`
 	LastError           string         `json:"last_error" gorm:"size:1024"`
 	LastLoginAt         *time.Time     `json:"last_login_at"`
 	LastUsedAt          *time.Time     `json:"last_used_at"`
@@ -95,6 +105,31 @@ type Account struct {
 	CreatedAt           time.Time      `json:"created_at"`
 	UpdatedAt           time.Time      `json:"updated_at"`
 	DeletedAt           gorm.DeletedAt `json:"-" gorm:"index"`
+}
+
+type AccountLoginSession struct {
+	ID                uint       `json:"id" gorm:"primaryKey"`
+	Email             string     `json:"email" gorm:"size:255;uniqueIndex;not null"`
+	Status            string     `json:"status" gorm:"size:32;index;not null"`
+	Success           bool       `json:"success" gorm:"not null;default:false"`
+	Message           string     `json:"message" gorm:"size:512"`
+	Error             string     `json:"error" gorm:"size:1024"`
+	ClientVersion     string     `json:"client_version" gorm:"size:80"`
+	LoginOptionsToken string     `json:"-" gorm:"type:text"`
+	CSRFState         string     `json:"-" gorm:"type:text"`
+	DeviceID          string     `json:"device_id" gorm:"size:120"`
+	CookiesJSON       string     `json:"-" gorm:"type:text"`
+	ProfileDir        string     `json:"profile_dir" gorm:"type:text"`
+	StorageStatePath  string     `json:"storage_state_path" gorm:"type:text"`
+	PendingStatePath  string     `json:"pending_state_path" gorm:"type:text"`
+	ProbePath         string     `json:"probe_path" gorm:"type:text"`
+	CurrentURL        string     `json:"current_url" gorm:"type:text"`
+	FinalURL          string     `json:"final_url" gorm:"type:text"`
+	Title             string     `json:"title" gorm:"size:255"`
+	LastLoginAt       *time.Time `json:"last_login_at"`
+	ExpiresAt         *time.Time `json:"expires_at" gorm:"index"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
 }
 
 type Model struct {

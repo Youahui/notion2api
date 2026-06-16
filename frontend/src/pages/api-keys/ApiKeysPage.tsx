@@ -21,7 +21,7 @@ export function ApiKeysPage() {
   return (
     <>
       <div className="page-header">
-        <h1 className="page-title">API Key</h1>
+        <h1 className="page-title">API 密钥</h1>
         <Button type="primary" icon={<PlusOutlined />} onClick={() => setOpen(true)}>
           新建
         </Button>
@@ -31,8 +31,17 @@ export function ApiKeysPage() {
         dataSource={rows}
         columns={[
           { title: '名称', dataIndex: 'name' },
-          { title: '前缀', dataIndex: 'key_prefix' },
-          { title: '后缀', dataIndex: 'key_suffix' },
+          {
+            title: 'API 密钥',
+            dataIndex: 'api_key',
+            render: (value: string, row) => value ? (
+              <Typography.Text code copyable={{ text: value }} ellipsis style={{ maxWidth: 360 }}>
+                {value}
+              </Typography.Text>
+            ) : (
+              <Typography.Text type="secondary">{`${row.key_prefix}...${row.key_suffix}（历史密钥无法恢复完整值）`}</Typography.Text>
+            )
+          },
           {
             title: '状态',
             dataIndex: 'enabled',
@@ -54,7 +63,7 @@ export function ApiKeysPage() {
                 >
                   {row.enabled ? '禁用' : '启用'}
                 </Button>
-                <Popconfirm title="删除 API Key" onConfirm={async () => { await adminApi.deleteApiKey(row.id); load(); }}>
+                <Popconfirm title="删除 API 密钥" onConfirm={async () => { await adminApi.deleteApiKey(row.id); load(); }}>
                   <Button size="small" danger>
                     删除
                   </Button>
@@ -64,7 +73,7 @@ export function ApiKeysPage() {
           }
         ]}
       />
-      <Modal title="新建 API Key" open={open} onCancel={() => setOpen(false)} onOk={() => form.submit()}>
+      <Modal title="新建 API 密钥" open={open} onCancel={() => setOpen(false)} onOk={() => form.submit()}>
         <Form
           form={form}
           layout="vertical"
@@ -75,8 +84,8 @@ export function ApiKeysPage() {
             form.resetFields();
             load();
             modal.info({
-              title: '完整 Key 仅显示一次',
-              content: <Typography.Text copyable>{created.secret}</Typography.Text>,
+              title: '完整密钥',
+              content: <Typography.Text code copyable={{ text: created.secret || created.api_key }}>{created.secret || created.api_key}</Typography.Text>,
               width: 560
             });
           }}
@@ -98,4 +107,3 @@ export function ApiKeysPage() {
     </>
   );
 }
-

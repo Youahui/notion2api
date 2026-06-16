@@ -30,12 +30,12 @@ export function DashboardPage() {
       <Row gutter={16}>
         <Col span={8}>
           <Card>
-            <Statistic title="API Key" value={keys.length} />
+            <Statistic title="API 密钥" value={keys.length} />
           </Card>
         </Col>
         <Col span={8}>
           <Card>
-            <Statistic title="启用 Key" value={keys.filter((key) => key.enabled).length} />
+            <Statistic title="启用密钥" value={keys.filter((key) => key.enabled).length} />
           </Card>
         </Col>
         <Col span={8}>
@@ -47,4 +47,3 @@ export function DashboardPage() {
     </>
   );
 }
-

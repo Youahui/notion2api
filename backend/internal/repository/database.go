@@ -86,6 +86,7 @@ func (s *Store) AutoMigrate() error {
 		&model.APIKey{},
 		&model.APIKeyUsage{},
 		&model.Account{},
+		&model.AccountLoginSession{},
 		&model.Model{},
 		&model.Conversation{},
 		&model.Message{},

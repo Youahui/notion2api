@@ -13,9 +13,13 @@ import (
 	"gorm.io/gorm"
 )
 
-func New(cfg config.Config, admins *service.AdminService, keys *service.APIKeyService, models *service.ModelService, accounts *service.AccountService, openai *service.OpenAIService, db *gorm.DB) *gin.Engine {
+func New(cfg config.Config, admins *service.AdminService, keys *service.APIKeyService, models *service.ModelService, accounts *service.AccountService, openai *service.OpenAIService, notion *service.NotionGateway, db *gorm.DB) *gin.Engine {
 	r := gin.New()
-	r.Use(gin.Recovery(), middleware.RequestID(), middleware.AccessLog())
+	r.Use(gin.Recovery(), middleware.RequestID())
+	if gin.IsDebugging() {
+		r.Use(middleware.DevRequestDetailsLog())
+	}
+	r.Use(middleware.AccessLog())
 	r.Use(cors.New(cors.Config{
 		AllowAllOrigins: true,
 		AllowMethods:    []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
@@ -23,7 +27,7 @@ func New(cfg config.Config, admins *service.AdminService, keys *service.APIKeySe
 		ExposeHeaders:   []string{"X-Request-ID"},
 	}))
 
-	h := handler.New(cfg, admins, keys, models, accounts, openai, db)
+	h := handler.New(cfg, admins, keys, models, accounts, openai, notion, db)
 
 	r.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
@@ -37,44 +41,77 @@ func New(cfg config.Config, admins *service.AdminService, keys *service.APIKeySe
 
 	r.POST("/admin/login", h.AdminLogin)
 	admin := r.Group("/admin")
-	admin.Use(middleware.AdminAuth(admins))
-	admin.POST("/logout", h.AdminLogout)
-	admin.GET("/verify", h.AdminVerify)
+	{
+		admin.Use(middleware.AdminAuth(admins))
+		admin.POST("/logout", h.AdminLogout)
+		admin.GET("/verify", h.AdminVerify)
 
-	admin.GET("/admins", h.AdminsList)
-	admin.POST("/admins", h.AdminsCreate)
-	admin.PUT("/admins/:id", h.AdminsUpdate)
-	admin.DELETE("/admins/:id", h.AdminsDelete)
+		adminGroup := admin.Group("/admins")
+		{
+			adminGroup.GET("", h.AdminsList)
+			adminGroup.POST("", h.AdminsCreate)
+			adminGroup.PUT("/:id", h.AdminsUpdate)
+			adminGroup.DELETE("/:id", h.AdminsDelete)
+		}
 
-	admin.GET("/api-keys", h.APIKeysList)
-	admin.POST("/api-keys", h.APIKeysCreate)
-	admin.GET("/api-keys/:id/usage", h.APIKeyUsage)
-	admin.GET("/api-keys/:id", h.APIKeysGet)
-	admin.PUT("/api-keys/:id", h.APIKeysUpdate)
-	admin.POST("/api-keys/:id/enable", h.APIKeysEnable)
-	admin.POST("/api-keys/:id/disable", h.APIKeysDisable)
-	admin.DELETE("/api-keys/:id", h.APIKeysDelete)
+		apiKeysGroup := admin.Group("/api-keys")
+		{
+			apiKeysGroup.GET("", h.APIKeysList)
+			apiKeysGroup.POST("", h.APIKeysCreate)
+			apiKeysGroup.GET("/:id/usage", h.APIKeyUsage)
+			apiKeysGroup.GET("/:id", h.APIKeysGet)
+			apiKeysGroup.PUT("/:id", h.APIKeysUpdate)
+			apiKeysGroup.POST("/:id/enable", h.APIKeysEnable)
+			apiKeysGroup.POST("/:id/disable", h.APIKeysDisable)
+			apiKeysGroup.DELETE("/:id", h.APIKeysDelete)
+		}
 
-	admin.GET("/models", h.AdminModels)
-	admin.GET("/accounts", h.AccountsList)
-	admin.POST("/accounts", h.AccountsCreate)
-	admin.PUT("/accounts/:id", h.AccountsUpdate)
-	admin.DELETE("/accounts/:id", h.AccountsDelete)
-	admin.POST("/accounts/:id/activate", h.AccountsActivate)
-	admin.POST("/accounts/:id/test", h.AccountsTest)
-	admin.GET("/usage", h.Usage)
-	admin.GET("/logs", h.Logs)
-	admin.GET("/settings", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"data": gin.H{}})
-	})
+		modelsGroup := admin.Group("/models")
+		{
+			modelsGroup.GET("", h.AdminModels)
+		}
+
+		accountsGroup := admin.Group("/accounts")
+		{
+			accountsGroup.GET("", h.AccountsList)
+			accountsGroup.POST("", h.AccountsCreate)
+
+			accountsGroup.POST("/manual", h.AccountsManualImport)
+			accountsGroup.POST("/login/start", h.AccountsLoginStart)
+			accountsGroup.POST("/login/verify", h.AccountsLoginVerify)
+			accountsGroup.GET("/login/status", h.AccountsLoginStatus)
+			accountsGroup.GET("/:id/spaces", h.AccountsSpaces)
+			accountsGroup.PUT("/:id", h.AccountsUpdate)
+			accountsGroup.DELETE("/:id", h.AccountsDelete)
+			accountsGroup.POST("/:id/activate", h.AccountsActivate)
+			accountsGroup.POST("/:id/refresh", h.AccountsRefresh)
+			accountsGroup.POST("/:id/test", h.AccountsTest)
+		}
+
+		notionConversationsGroup := admin.Group("/notion-conversations")
+		{
+			notionConversationsGroup.GET("", h.NotionConversationsList)
+			notionConversationsGroup.GET("/:thread_id", h.NotionConversationGet)
+			notionConversationsGroup.DELETE("/:thread_id", h.NotionConversationDelete)
+		}
+
+		admin.GET("/usage", h.Usage)
+		admin.GET("/logs", h.Logs)
+		admin.GET("/settings", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{"data": gin.H{}})
+		})
+
+	}
 
 	v1 := r.Group("/v1")
-	v1.Use(middleware.APIKeyAuth(keys))
-	v1.GET("/models", h.OpenAIModels)
-	v1.GET("/models/:id", h.OpenAIModel)
-	v1.POST("/chat/completions", h.ChatCompletions)
-	v1.POST("/responses", h.Responses)
-	v1.GET("/responses/:id", h.ResponseByID)
+	{
+		v1.Use(middleware.APIKeyAuth(keys))
+		v1.GET("/models", h.OpenAIModels)
+		v1.GET("/models/:id", h.OpenAIModel)
+		v1.POST("/chat/completions", h.ChatCompletions)
+		v1.POST("/responses", h.Responses)
+		v1.GET("/responses/:id", h.ResponseByID)
+	}
 
 	return r
 }

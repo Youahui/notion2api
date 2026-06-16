@@ -12,7 +12,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-const apiKeyPrefix = "n2a"
+const DefaultAPIKeyPrefix = "n2a"
 
 func HashPassword(password string) (string, error) {
 	raw, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
@@ -34,14 +34,23 @@ func GenerateOpaqueToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
-func GenerateAPIKey() (secret string, prefix string, suffix string, err error) {
+func GenerateAPIKey(apiKeyPrefix string) (secret string, prefix string, suffix string, err error) {
 	token, err := GenerateOpaqueToken()
 	if err != nil {
 		return "", "", "", err
 	}
+	apiKeyPrefix = NormalizeAPIKeyPrefix(apiKeyPrefix)
 	secret = apiKeyPrefix + "_" + token
 	prefix, suffix = APIKeyParts(secret)
 	return secret, prefix, suffix, nil
+}
+
+func NormalizeAPIKeyPrefix(apiKeyPrefix string) string {
+	apiKeyPrefix = strings.Trim(strings.TrimSpace(apiKeyPrefix), "_")
+	if apiKeyPrefix == "" {
+		return DefaultAPIKeyPrefix
+	}
+	return apiKeyPrefix
 }
 
 func APIKeyParts(secret string) (prefix string, suffix string) {

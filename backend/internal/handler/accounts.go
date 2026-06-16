@@ -34,6 +34,70 @@ func (h *Handler) AccountsCreate(c *gin.Context) {
 	respond.JSON(c, http.StatusCreated, row)
 }
 
+func (h *Handler) AccountsManualImport(c *gin.Context) {
+	var req dto.ManualImportAccountRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respond.BadRequest(c, "invalid account import payload")
+		return
+	}
+	row, err := h.accounts.ManualImport(c.Request.Context(), req)
+	if err != nil {
+		handleServiceError(c, err)
+		return
+	}
+	respond.JSON(c, http.StatusCreated, row)
+}
+
+func (h *Handler) AccountsLoginStart(c *gin.Context) {
+	var req dto.AccountLoginStartRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respond.BadRequest(c, "invalid login start payload")
+		return
+	}
+	row, err := h.accounts.StartEmailLogin(c.Request.Context(), req)
+	if err != nil {
+		handleServiceError(c, err)
+		return
+	}
+	respond.JSON(c, http.StatusOK, row)
+}
+
+func (h *Handler) AccountsLoginVerify(c *gin.Context) {
+	var req dto.AccountLoginVerifyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respond.BadRequest(c, "invalid login verify payload")
+		return
+	}
+	row, err := h.accounts.VerifyEmailLogin(c.Request.Context(), req)
+	if err != nil {
+		handleServiceError(c, err)
+		return
+	}
+	respond.JSON(c, http.StatusOK, row)
+}
+
+func (h *Handler) AccountsLoginStatus(c *gin.Context) {
+	rows, err := h.accounts.LoginStatus(c.Request.Context(), c.Query("email"))
+	if err != nil {
+		handleServiceError(c, err)
+		return
+	}
+	respond.JSON(c, http.StatusOK, gin.H{"data": rows})
+}
+
+func (h *Handler) AccountsSpaces(c *gin.Context) {
+	id, ok := parseID(c)
+	if !ok {
+		return
+	}
+	rows, err := h.accounts.Spaces(c.Request.Context(), id)
+	if err != nil {
+		handleServiceError(c, err)
+		return
+	}
+	respond.JSON(c, http.StatusOK, gin.H{"data": rows})
+}
+
 func (h *Handler) AccountsUpdate(c *gin.Context) {
 	id, ok := parseID(c)
 	if !ok {
@@ -75,6 +139,19 @@ func (h *Handler) AccountsActivate(c *gin.Context) {
 		return
 	}
 	respond.JSON(c, http.StatusOK, row)
+}
+
+func (h *Handler) AccountsRefresh(c *gin.Context) {
+	id, ok := parseID(c)
+	if !ok {
+		return
+	}
+	row, err := h.accounts.RefreshSession(c.Request.Context(), id)
+	if err != nil {
+		handleServiceError(c, err)
+		return
+	}
+	respond.JSON(c, http.StatusOK, service.AccountDTO(row))
 }
 
 func (h *Handler) AccountsTest(c *gin.Context) {

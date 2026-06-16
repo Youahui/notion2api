@@ -22,7 +22,8 @@ export const router = createBrowserRouter([
       { index: true, element: <DashboardPage /> },
       { path: 'admins', element: <AdminsPage /> },
       { path: 'api-keys', element: <ApiKeysPage /> },
-      { path: 'accounts', element: <AccountsPage /> },
+      { path: 'accounts', element: <Navigate to="/admin/accounts/list" replace /> },
+      { path: 'accounts/:tab', element: <AccountsPage /> },
       { path: 'models', element: <ModelsPage /> },
       { path: 'conversations', element: <ConversationsPage /> },
       { path: 'settings', element: <SettingsPage /> },
@@ -32,4 +33,3 @@ export const router = createBrowserRouter([
     ]
   }
 ]);
-

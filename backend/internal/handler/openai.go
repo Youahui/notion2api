@@ -2,8 +2,11 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"notaion2api/backend/internal/dto"
@@ -134,11 +137,35 @@ func (h *Handler) streamChatCompletion(c *gin.Context, result service.Completion
 }
 
 func handleOpenAIError(c *gin.Context, err error) {
+	if err != nil {
+		slog.Error("openai request failed",
+			"request_id", c.GetString("request_id"),
+			"path", c.Request.URL.Path,
+			"error", err,
+		)
+	}
+	var notionAPIError *service.NotionAPIError
+	var noAssistantTextError *service.NotionNoAssistantTextError
+	var inferenceStepError *service.NotionInferenceStepError
 	switch {
 	case err == nil:
 		return
 	case err == service.ErrNotFound:
 		c.JSON(http.StatusBadRequest, service.OpenAIError("unknown model", "invalid_request_error", "model_not_found"))
+	case errors.Is(err, service.ErrConflict):
+		c.JSON(http.StatusBadRequest, service.OpenAIError(err.Error(), "invalid_request_error", "sticky_session_conflict"))
+	case errors.Is(err, service.ErrForbidden):
+		c.JSON(http.StatusForbidden, service.OpenAIError(err.Error(), "invalid_request_error", "account_forbidden"))
+	case errors.As(err, &notionAPIError):
+		c.JSON(http.StatusBadGateway, service.OpenAIError(notionAPIError.Error(), "api_error", "notion_upstream_error"))
+	case errors.As(err, &inferenceStepError):
+		if strings.EqualFold(strings.TrimSpace(inferenceStepError.SubType), "premium-feature-unavailable") {
+			c.JSON(http.StatusTooManyRequests, service.OpenAIError(inferenceStepError.Error(), "rate_limit_error", "premium_feature_unavailable"))
+			return
+		}
+		c.JSON(http.StatusBadGateway, service.OpenAIError(inferenceStepError.Error(), "api_error", "notion_inference_error"))
+	case errors.As(err, &noAssistantTextError):
+		c.JSON(http.StatusBadGateway, service.OpenAIError(noAssistantTextError.Error(), "api_error", "notion_no_assistant_text"))
 	default:
 		c.JSON(http.StatusInternalServerError, service.OpenAIError("internal server error", "api_error", "internal_error"))
 	}

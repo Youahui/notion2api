@@ -28,23 +28,24 @@ func Run(ctx context.Context, configPath string) error {
 	}
 
 	admins := service.NewAdminService(store, cfg.Security.AdminTokenTTLHours)
-	keys := service.NewAPIKeyService(store)
+	keys := service.NewAPIKeyService(store, cfg.Security.APIKeyPrefix)
 	models := service.NewModelService(store)
-	accounts := service.NewAccountService(store)
+	accounts := service.NewAccountService(store, cfg)
 	notion := service.NewNotionGateway(cfg)
-	openai := service.NewOpenAIService(cfg, models, accounts, notion)
+	sticky := service.NewStickySessionStore(cfg.Sticky)
+	openai := service.NewOpenAIService(cfg, models, accounts, notion, sticky)
 
 	if err := admins.SeedBootstrapAdmin(ctx, cfg.Security.BootstrapAdmin); err != nil {
 		return fmt.Errorf("seed admin: %w", err)
 	}
 	if err := keys.SeedBootstrapAPIKey(ctx, cfg.Security.BootstrapAPIKey); err != nil {
-		return fmt.Errorf("seed api key: %w", err)
+		return fmt.Errorf("seed API 密钥: %w", err)
 	}
 	if err := models.SeedDefaults(ctx); err != nil {
 		return fmt.Errorf("seed models: %w", err)
 	}
 
-	engine := router.New(cfg, admins, keys, models, accounts, openai, store.DB())
+	engine := router.New(cfg, admins, keys, models, accounts, openai, notion, store.DB())
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	server := &http.Server{Addr: addr, Handler: engine}
 

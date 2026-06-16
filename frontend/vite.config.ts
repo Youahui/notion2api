@@ -7,7 +7,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/admin': {
-        target: 'http://127.0.0.1:8787',
+        target: 'http://127.0.0.1:9998',
         changeOrigin: true,
         bypass(req) {
           if (req.headers.accept?.includes('text/html')) {

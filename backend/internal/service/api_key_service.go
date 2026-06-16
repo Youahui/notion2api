@@ -15,7 +15,8 @@ import (
 )
 
 type APIKeyService struct {
-	store *repository.Store
+	store        *repository.Store
+	apiKeyPrefix string
 }
 
 type UsageRecord struct {
@@ -32,8 +33,8 @@ type UsageRecord struct {
 	ErrorSummary     string
 }
 
-func NewAPIKeyService(store *repository.Store) *APIKeyService {
-	return &APIKeyService{store: store}
+func NewAPIKeyService(store *repository.Store, apiKeyPrefix string) *APIKeyService {
+	return &APIKeyService{store: store, apiKeyPrefix: security.NormalizeAPIKeyPrefix(apiKeyPrefix)}
 }
 
 func (s *APIKeyService) SeedBootstrapAPIKey(ctx context.Context, secret string) error {
@@ -52,6 +53,7 @@ func (s *APIKeyService) SeedBootstrapAPIKey(ctx context.Context, secret string) 
 	return s.store.CreateAPIKey(ctx, &model.APIKey{
 		Name:      "bootstrap",
 		KeyHash:   security.HashSecret(secret),
+		APIKey:    secret,
 		KeyPrefix: prefix,
 		KeySuffix: suffix,
 		Enabled:   true,
@@ -63,7 +65,7 @@ func (s *APIKeyService) Create(ctx context.Context, ownerAdminID uint, req dto.C
 	if name == "" {
 		return dto.CreateAPIKeyResponse{}, ErrInvalid
 	}
-	secret, prefix, suffix, err := security.GenerateAPIKey()
+	secret, prefix, suffix, err := security.GenerateAPIKey(s.apiKeyPrefix)
 	if err != nil {
 		return dto.CreateAPIKeyResponse{}, err
 	}
@@ -74,6 +76,7 @@ func (s *APIKeyService) Create(ctx context.Context, ownerAdminID uint, req dto.C
 	key := model.APIKey{
 		Name:            name,
 		KeyHash:         security.HashSecret(secret),
+		APIKey:          secret,
 		KeyPrefix:       prefix,
 		KeySuffix:       suffix,
 		Enabled:         enabled,
@@ -246,14 +249,52 @@ func (s *APIKeyService) Usage(ctx context.Context, filter repository.UsageFilter
 	return s.store.ListUsage(ctx, filter)
 }
 
-func (s *APIKeyService) Logs(ctx context.Context, limit int) ([]model.RequestLog, error) {
-	return s.store.ListRequestLogs(ctx, limit)
+func (s *APIKeyService) Logs(ctx context.Context, limit int) ([]dto.RequestLogDTO, error) {
+	rows, err := s.store.ListRequestLogs(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	keysByID, err := s.apiKeysByRequestLogID(ctx, rows)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]dto.RequestLogDTO, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, RequestLogDTO(row, keysByID))
+	}
+	return out, nil
+}
+
+func (s *APIKeyService) apiKeysByRequestLogID(ctx context.Context, rows []model.RequestLog) (map[uint]model.APIKey, error) {
+	seen := map[uint]struct{}{}
+	ids := make([]uint, 0)
+	for _, row := range rows {
+		if row.APIKeyID == nil || *row.APIKeyID == 0 {
+			continue
+		}
+		id := *row.APIKeyID
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	keys, err := s.store.FindAPIKeysByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[uint]model.APIKey, len(keys))
+	for _, key := range keys {
+		out[key.ID] = key
+	}
+	return out, nil
 }
 
 func APIKeyDTO(key model.APIKey) dto.APIKeyDTO {
 	return dto.APIKeyDTO{
 		ID:              key.ID,
 		Name:            key.Name,
+		APIKey:          key.APIKey,
 		KeyPrefix:       key.KeyPrefix,
 		KeySuffix:       key.KeySuffix,
 		Enabled:         key.Enabled,
@@ -266,5 +307,52 @@ func APIKeyDTO(key model.APIKey) dto.APIKeyDTO {
 		TotalTokens:     key.TotalTokens,
 		CreatedAt:       key.CreatedAt,
 		UpdatedAt:       key.UpdatedAt,
+	}
+}
+
+func RequestLogDTO(row model.RequestLog, keysByID map[uint]model.APIKey) dto.RequestLogDTO {
+	var keyName string
+	var keyMasked string
+	if row.APIKeyID != nil {
+		if key, ok := keysByID[*row.APIKeyID]; ok {
+			keyName = key.Name
+			keyMasked = maskedAPIKey(key)
+		}
+	}
+	createdAt := row.CreatedAt
+	return dto.RequestLogDTO{
+		ID:               row.ID,
+		APIKeyID:         row.APIKeyID,
+		APIKeyName:       keyName,
+		APIKeyMasked:     keyMasked,
+		Method:           row.Method,
+		Route:            row.Route,
+		StatusCode:       row.StatusCode,
+		LatencyMs:        row.LatencyMs,
+		Model:            row.Model,
+		PromptTokens:     row.PromptTokens,
+		CompletionTokens: row.CompletionTokens,
+		TotalTokens:      row.TotalTokens,
+		Estimated:        row.Estimated,
+		ErrorSummary:     row.ErrorSummary,
+		CreatedAt:        &createdAt,
+	}
+}
+
+func maskedAPIKey(key model.APIKey) string {
+	prefix := strings.TrimSpace(key.KeyPrefix)
+	suffix := strings.TrimSpace(key.KeySuffix)
+	if prefix == "" && strings.TrimSpace(key.APIKey) != "" {
+		prefix, suffix = security.APIKeyParts(key.APIKey)
+	}
+	switch {
+	case prefix != "" && suffix != "":
+		return prefix + "..." + suffix
+	case prefix != "":
+		return prefix + "..."
+	case suffix != "":
+		return "..." + suffix
+	default:
+		return ""
 	}
 }

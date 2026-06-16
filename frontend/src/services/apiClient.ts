@@ -13,6 +13,15 @@ export function setAdminToken(token: string) {
   }
 }
 
+function redirectToLoginOnUnauthorized(path: string) {
+  if (path === '/admin/login' || window.location.pathname === '/admin/login') {
+    return;
+  }
+  setAdminToken('');
+  const currentPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  window.location.replace(`/admin/login?redirect=${encodeURIComponent(currentPath)}`);
+}
+
 export async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (!headers.has('Content-Type') && init.body) {
@@ -29,6 +38,9 @@ export async function request<T>(path: string, init: RequestInit = {}): Promise<
   const contentType = response.headers.get('content-type') ?? '';
   const payload = contentType.includes('application/json') ? await response.json() : await response.text();
   if (!response.ok) {
+    if (response.status === 401) {
+      redirectToLoginOnUnauthorized(path);
+    }
     const detail = typeof payload === 'object' && payload !== null && 'detail' in payload ? String(payload.detail) : response.statusText;
     throw new Error(detail || '请求失败');
   }
@@ -38,4 +50,3 @@ export async function request<T>(path: string, init: RequestInit = {}): Promise<
 export function jsonBody(value: unknown) {
   return JSON.stringify(value);
 }
-
