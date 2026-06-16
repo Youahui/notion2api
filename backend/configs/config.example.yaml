@@ -1,0 +1,42 @@
+server:
+  host: 127.0.0.1
+  port: 8787
+
+security:
+  admin_token_ttl_hours: 24
+  bootstrap_admin:
+    username: admin
+    password: change-me-please
+  bootstrap_api_key: ""
+
+database:
+  driver: sqlite
+  dsn: data/notaion2api.sqlite
+  max_idle_conns: 5
+  max_open_conns: 20
+  conn_max_lifetime_seconds: 3600
+
+upstream:
+  base_url: https://www.notion.so
+  origin: https://www.notion.so
+  timeout_seconds: 180
+  poll_interval_seconds: 1.5
+  poll_max_rounds: 40
+
+proxy:
+  mode: off
+  url: ""
+  http_url: ""
+  https_url: ""
+
+features:
+  web_search: true
+  generate_image: true
+  csv_attachment: true
+  fresh_thread_per_request: true
+
+storage:
+  persist_conversations: true
+  persist_responses: true
+  response_ttl_seconds: 3600
+
