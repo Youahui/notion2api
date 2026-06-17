@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"notaion2api/backend/internal/config"
+	"notaion2api/backend/internal/model"
+	"notaion2api/backend/internal/repository"
 )
 
 func TestNewStickySessionStoreDefaultsToLocalCache(t *testing.T) {
@@ -50,6 +52,92 @@ func TestMemoryStickySessionStoreBindsAndExpires(t *testing.T) {
 	}
 	if ok {
 		t.Fatal("expected sticky binding to expire")
+	}
+}
+
+func TestMemoryStickySessionStoreAliasPreservesThreadID(t *testing.T) {
+	store := newMemoryStickySessionStore(time.Minute)
+	ctx := context.Background()
+
+	err := store.Set(ctx, StickyThreadBinding{
+		StickyKey:    "client:k7:header_session_id:sess-1",
+		ThreadID:     "notion-thread-1",
+		AccountID:    42,
+		AccountEmail: "owner@example.com",
+	}, time.Minute)
+	if err != nil {
+		t.Fatalf("set sticky alias: %v", err)
+	}
+
+	got, ok, err := store.Get(ctx, "client:k7:header_session_id:sess-1")
+	if err != nil {
+		t.Fatalf("get sticky alias: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected sticky alias hit")
+	}
+	if got.ThreadID != "notion-thread-1" || got.StickyKey != "client:k7:header_session_id:sess-1" {
+		t.Fatalf("sticky alias lost thread/key: %+v", got)
+	}
+}
+
+func TestOpenAIServiceSelectAccountForClientSessionBinding(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.Database.DSN = ":memory:"
+	store, err := repository.OpenDatabase(cfg.Database)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	if err := store.AutoMigrate(); err != nil {
+		t.Fatalf("auto migrate: %v", err)
+	}
+	account := model.Account{Email: "owner@example.com", Enabled: true, Status: "ready"}
+	if err := store.CreateAccount(ctx, &account); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	sticky := newMemoryStickySessionStore(time.Minute)
+	sessionKey := clientStickyKey(7, "header_session_id", "sess-1")
+	if err := sticky.Set(ctx, StickyThreadBinding{
+		StickyKey:    sessionKey.Key,
+		ThreadID:     "notion-thread-1",
+		AccountID:    account.ID,
+		AccountEmail: account.Email,
+	}, time.Minute); err != nil {
+		t.Fatalf("set sticky alias: %v", err)
+	}
+	svc := &OpenAIService{cfg: cfg, accounts: NewAccountService(store, cfg), sticky: sticky}
+
+	selection, err := svc.selectAccountForStickyKeys(ctx, "", "", []stickySessionKey{sessionKey})
+	if err != nil {
+		t.Fatalf("select account: %v", err)
+	}
+	if !selection.StickyHit || selection.Source != "header_session_id" {
+		t.Fatalf("expected sticky hit, got %+v", selection)
+	}
+	if selection.Account.ID != account.ID || selection.ThreadID != "notion-thread-1" {
+		t.Fatalf("unexpected sticky selection: %+v", selection)
+	}
+}
+
+func TestResponseStickySessionKeysPrioritizePreviousResponseID(t *testing.T) {
+	keys := responseStickySessionKeys(map[string]any{
+		"previous_response_id": "resp_prev",
+		"conversation_id":      "conv-body",
+		"metadata":             map[string]any{"session_id": "meta-session"},
+	}, OpenAIRequestOptions{
+		APIKeyID:             7,
+		HeaderSessionID:      "sess-header",
+		HeaderConversationID: "conv-header",
+	})
+	if len(keys) < 4 {
+		t.Fatalf("expected several sticky keys, got %+v", keys)
+	}
+	if keys[0].Key != "response:k7:resp_prev" || keys[0].Source != "previous_response_id" {
+		t.Fatalf("previous_response_id should be first, got %+v", keys[0])
+	}
+	if keys[1].Key != "client:k7:header_session_id:sess-header" {
+		t.Fatalf("header session key should be isolated by api key, got %+v", keys[1])
 	}
 }
 

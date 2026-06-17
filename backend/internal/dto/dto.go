@@ -85,9 +85,11 @@ type ChatCompletionRequest struct {
 	Stream             bool          `json:"stream"`
 	ConversationID     string        `json:"conversation_id"`
 	Conversation       string        `json:"conversation"`
+	PromptCacheKey     string        `json:"prompt_cache_key"`
 	ThreadID           string        `json:"thread_id"`
 	Thread             string        `json:"thread"`
 	NotionThreadID     string        `json:"notion_thread_id"`
+	User               string        `json:"user"`
 	AccountEmail       string        `json:"account_email"`
 	NotionAccountEmail string        `json:"notion_account_email"`
 	UseWebSearch       *bool         `json:"use_web_search"`

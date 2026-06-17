@@ -43,7 +43,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		return
 	}
 	apiKey, _ := requestctx.APIKey(c)
-	result, err := h.openai.ChatCompletion(c.Request.Context(), req)
+	result, err := h.openai.ChatCompletion(c.Request.Context(), req, openAIRequestOptions(c, apiKey.ID))
 	if err != nil {
 		handleOpenAIError(c, err)
 		return
@@ -75,7 +75,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 	apiKey, _ := requestctx.APIKey(c)
-	result, err := h.openai.Response(c.Request.Context(), body)
+	result, err := h.openai.Response(c.Request.Context(), body, openAIRequestOptions(c, apiKey.ID))
 	if err != nil {
 		handleOpenAIError(c, err)
 		return
@@ -101,6 +101,24 @@ func (h *Handler) Responses(c *gin.Context) {
 
 func (h *Handler) ResponseByID(c *gin.Context) {
 	c.JSON(http.StatusNotImplemented, service.OpenAIError("response store lookup is not implemented yet", "invalid_request_error", "not_implemented"))
+}
+
+func openAIRequestOptions(c *gin.Context, apiKeyID uint) service.OpenAIRequestOptions {
+	return service.OpenAIRequestOptions{
+		APIKeyID:             apiKeyID,
+		RequestID:            c.GetString("request_id"),
+		HeaderSessionID:      firstOpenAIHeader(c, "session_id", "Session-Id", "X-Session-Id"),
+		HeaderConversationID: firstOpenAIHeader(c, "conversation_id", "Conversation-Id", "X-Conversation-Id"),
+	}
+}
+
+func firstOpenAIHeader(c *gin.Context, names ...string) string {
+	for _, name := range names {
+		if value := strings.TrimSpace(c.GetHeader(name)); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (h *Handler) AdminModels(c *gin.Context) {
@@ -145,6 +163,7 @@ func (h *Handler) streamResponse(c *gin.Context, result service.CompletionResult
 	c.Header("Connection", "keep-alive")
 	c.Status(http.StatusOK)
 
+	requestID := c.GetString("request_id")
 	outputItems := responseOutputItems(result.Payload["output"])
 	if len(outputItems) > 0 && responseStringField(outputItems[0], "type") == "function_call" {
 		h.streamResponseFunctionCall(c, result, outputItems[0])
@@ -165,10 +184,12 @@ func (h *Handler) streamResponse(c *gin.Context, result service.CompletionResult
 		if payload == nil {
 			payload = map[string]any{}
 		}
+		eventSequence := sequenceNumber
 		payload["type"] = event
-		payload["sequence_number"] = sequenceNumber
+		payload["sequence_number"] = eventSequence
 		sequenceNumber++
 		encoded, _ := json.Marshal(payload)
+		logResponsesSSESendEvent(requestID, responseID, event, eventSequence, payload, encoded)
 		writeSSE(c.Writer, event, encoded)
 	}
 
@@ -220,10 +241,16 @@ func (h *Handler) streamResponse(c *gin.Context, result service.CompletionResult
 	writeEvent("response.completed", map[string]any{
 		"response": result.Payload,
 	})
+	slog.Info("responses sse send done",
+		"request_id", requestID,
+		"response_id", responseID,
+		"events", sequenceNumber,
+	)
 	writeSSEDone(c.Writer)
 }
 
 func (h *Handler) streamResponseFunctionCall(c *gin.Context, result service.CompletionResult, item map[string]any) {
+	requestID := c.GetString("request_id")
 	responseID := responseStringField(result.Payload, "id")
 	outputItemID := responseStringField(item, "id")
 	if outputItemID == "" {
@@ -244,10 +271,12 @@ func (h *Handler) streamResponseFunctionCall(c *gin.Context, result service.Comp
 		if payload == nil {
 			payload = map[string]any{}
 		}
+		eventSequence := sequenceNumber
 		payload["type"] = event
-		payload["sequence_number"] = sequenceNumber
+		payload["sequence_number"] = eventSequence
 		sequenceNumber++
 		encoded, _ := json.Marshal(payload)
+		logResponsesSSESendEvent(requestID, responseID, event, eventSequence, payload, encoded)
 		writeSSE(c.Writer, event, encoded)
 	}
 
@@ -280,6 +309,11 @@ func (h *Handler) streamResponseFunctionCall(c *gin.Context, result service.Comp
 	writeEvent("response.completed", map[string]any{
 		"response": result.Payload,
 	})
+	slog.Info("responses sse send done",
+		"request_id", requestID,
+		"response_id", responseID,
+		"events", sequenceNumber,
+	)
 	writeSSEDone(c.Writer)
 }
 
@@ -377,6 +411,125 @@ func splitResponseTextChunks(text string, chunkRunes int) []string {
 		chunks = append(chunks, string(runes[start:end]))
 	}
 	return chunks
+}
+
+func logResponsesSSESendEvent(requestID string, responseID string, event string, sequenceNumber int, payload map[string]any, encoded []byte) {
+	slog.Info("responses sse send event",
+		"request_id", strings.TrimSpace(requestID),
+		"response_id", strings.TrimSpace(responseID),
+		"event", event,
+		"sequence_number", sequenceNumber,
+		"json_bytes", len(encoded),
+		"payload_summary", summarizeResponsesSSEPayload(payload),
+	)
+}
+
+func summarizeResponsesSSEPayload(payload map[string]any) map[string]any {
+	summary := map[string]any{}
+	if payload == nil {
+		return summary
+	}
+	for _, key := range []string{"type", "response_id", "item_id"} {
+		if value := responseSSEString(payload[key]); value != "" {
+			summary[key] = value
+		}
+	}
+	for _, key := range []string{"sequence_number", "output_index", "content_index"} {
+		if value, ok := payload[key]; ok {
+			summary[key] = value
+		}
+	}
+	addTextSummary(summary, "delta", responseSSEString(payload["delta"]))
+	addTextSummary(summary, "text", responseSSEString(payload["text"]))
+	addTextSummary(summary, "arguments", responseSSEString(payload["arguments"]))
+	if part := responseSSEMap(payload["part"]); part != nil {
+		summary["part_type"] = responseSSEString(part["type"])
+		addTextSummary(summary, "part_text", responseSSEString(part["text"]))
+	}
+	if item := responseSSEMap(payload["item"]); item != nil {
+		summary["item"] = summarizeResponsesSSEItem(item)
+	}
+	if response := responseSSEMap(payload["response"]); response != nil {
+		summary["response"] = summarizeResponsesSSEResponse(response)
+	}
+	return summary
+}
+
+func summarizeResponsesSSEItem(item map[string]any) map[string]any {
+	summary := map[string]any{}
+	for _, key := range []string{"id", "type", "status", "role", "call_id", "name"} {
+		if value := responseSSEString(item[key]); value != "" {
+			summary[key] = value
+		}
+	}
+	addTextSummary(summary, "arguments", responseSSEString(item["arguments"]))
+	if content := responseSSESlice(item["content"]); len(content) > 0 {
+		if part := responseSSEMap(content[0]); part != nil {
+			summary["content_part_type"] = responseSSEString(part["type"])
+			addTextSummary(summary, "content_text", responseSSEString(part["text"]))
+		}
+		summary["content_parts"] = len(content)
+	}
+	return summary
+}
+
+func summarizeResponsesSSEResponse(response map[string]any) map[string]any {
+	summary := map[string]any{}
+	for _, key := range []string{"id", "status", "model"} {
+		if value := responseSSEString(response[key]); value != "" {
+			summary[key] = value
+		}
+	}
+	addTextSummary(summary, "output_text", responseSSEString(response["output_text"]))
+	if output := responseSSESlice(response["output"]); output != nil {
+		summary["output_items"] = len(output)
+	}
+	return summary
+}
+
+func addTextSummary(summary map[string]any, key string, text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	summary[key+"_chars"] = len([]rune(text))
+	summary[key+"_preview"] = responseSSEPreview(text, 240)
+}
+
+func responseSSEMap(value any) map[string]any {
+	if mapped, ok := value.(map[string]any); ok {
+		return mapped
+	}
+	return nil
+}
+
+func responseSSESlice(value any) []any {
+	if items, ok := value.([]any); ok {
+		return items
+	}
+	return nil
+}
+
+func responseSSEString(value any) string {
+	if text, ok := value.(string); ok {
+		return strings.TrimSpace(text)
+	}
+	return ""
+}
+
+func responseSSEPreview(text string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	clean := strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+	runes := []rune(clean)
+	if len(runes) <= limit {
+		return clean
+	}
+	if limit == 1 {
+		return string(runes[:1])
+	}
+	return strings.TrimSpace(string(runes[:limit-1])) + "..."
 }
 
 func writeSSE(w http.ResponseWriter, event string, payload []byte) {

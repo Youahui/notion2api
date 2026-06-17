@@ -36,6 +36,8 @@ type NotionPromptRequest struct {
 	Prompt           string
 	HiddenPrompt     string
 	HiddenMessages   []hiddenPromptMessage
+	Attachments      []NotionAttachmentUpload
+	RequestID        string
 	PublicModel      string
 	NotionModel      string
 	UseWebSearch     bool
@@ -51,6 +53,34 @@ type NotionRunResult struct {
 	ConvertedOnly bool
 	Payload       map[string]any
 	RawResponse   string
+}
+
+type notionTextStreamResult struct {
+	Text        string
+	MessageID   string
+	RawResponse string
+	Completed   bool
+}
+
+type notionFinalAnswerResult struct {
+	Text      string
+	MessageID string
+	Completed bool
+}
+
+type NotionAttachmentUpload struct {
+	Name        string
+	ContentType string
+	Data        []byte
+	Source      string
+}
+
+type NotionUploadedAttachment struct {
+	Name          string
+	ContentType   string
+	AttachmentURL string
+	SignedURL     string
+	TaskIDs       []string
 }
 
 type NotionAPIError struct {
@@ -516,6 +546,14 @@ func (g *NotionGateway) RunPrompt(ctx context.Context, account model.Account, re
 			Payload:       payload,
 		}, nil
 	}
+	if len(req.Attachments) > 0 {
+		createThread, _ := boolFromAny(payload["createThread"])
+		uploaded, err := g.UploadAssistantChatAttachments(ctx, account, threadID, createThread, req.Attachments)
+		if err != nil {
+			return NotionRunResult{ThreadID: threadID, Payload: payload}, err
+		}
+		injectUploadedAttachmentsIntoPayload(payload, account, uploaded)
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return NotionRunResult{}, err
@@ -542,7 +580,8 @@ func (g *NotionGateway) RunPrompt(ctx context.Context, account model.Account, re
 		}
 		return NotionRunResult{ThreadID: threadID, Payload: payload, RawResponse: string(raw)}, &NotionAPIError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(raw))}
 	}
-	text, messageID, rawResponse, err := consumeNotionTextStream(resp.Body, threadID, notionIdleAfterAnswerTimeout)
+	streamResult, err := consumeNotionTextStream(resp.Body, threadID, notionIdleAfterAnswerTimeout, req.RequestID)
+	text, messageID, rawResponse := streamResult.Text, streamResult.MessageID, streamResult.RawResponse
 	if err != nil {
 		return NotionRunResult{ThreadID: threadID, Payload: payload, RawResponse: rawResponse}, err
 	}
@@ -588,6 +627,47 @@ func (g *NotionGateway) RunPrompt(ctx context.Context, account model.Account, re
 		}
 		return NotionRunResult{ThreadID: threadID, Payload: payload, RawResponse: rawResponse}, &NotionNoAssistantTextError{ThreadID: threadID, Cause: cause}
 	}
+	if !streamResult.Completed {
+		recoveredText, recoveredMessageID, recoverErr := g.loadCompletedFinalAnswerAfterIncompleteStream(ctx, account, threadID, rawResponse)
+		if strings.TrimSpace(recoveredText) != "" {
+			if recoverErr != nil {
+				slog.Warn("notion completed sync did not observe completion signal; using latest synced assistant text",
+					"thread_id", threadID,
+					"message_id", recoveredMessageID,
+					"error", recoverErr,
+				)
+			}
+			return NotionRunResult{Text: recoveredText, ThreadID: threadID, MessageID: recoveredMessageID, Payload: payload, RawResponse: rawResponse}, nil
+		}
+		if recoverErr != nil {
+			slog.Warn("notion stream returned assistant text before completion; using latest stream text",
+				"thread_id", threadID,
+				"message_id", messageID,
+				"error", recoverErr,
+			)
+		}
+	}
+	if streamResult.Completed {
+		recoveredText, recoveredMessageID, recoverErr := g.loadCompletedFinalAnswerAfterCompletedStream(ctx, account, threadID, streamResult)
+		if shouldUseSyncedCompletedAnswer(streamResult, recoveredText, recoveredMessageID) {
+			if recoverErr != nil {
+				slog.Warn("notion completed stream sync did not observe completion signal; using synced assistant text",
+					"thread_id", threadID,
+					"message_id", recoveredMessageID,
+					"error", recoverErr,
+				)
+			}
+			return NotionRunResult{Text: recoveredText, ThreadID: threadID, MessageID: recoveredMessageID, Payload: payload, RawResponse: rawResponse}, nil
+		}
+		if recoverErr != nil {
+			slog.Debug("notion completed stream final sync skipped",
+				"thread_id", threadID,
+				"stream_message_id", messageID,
+				"synced_message_id", recoveredMessageID,
+				"error", recoverErr,
+			)
+		}
+	}
 	return NotionRunResult{Text: text, ThreadID: threadID, MessageID: messageID, Payload: payload, RawResponse: rawResponse}, nil
 }
 
@@ -620,7 +700,8 @@ func (g *NotionGateway) runInferenceTranscriptWithSurfFallback(ctx context.Conte
 	if err != nil {
 		return "", "", "", fmt.Errorf("%w; surf fallback failed: %v", upstreamErr, err)
 	}
-	text, messageID, rawResponse, err := consumeNotionTextStream(io.NopCloser(strings.NewReader(body)), threadID, notionIdleAfterAnswerTimeout)
+	streamResult, err := consumeNotionTextStream(io.NopCloser(strings.NewReader(body)), threadID, notionIdleAfterAnswerTimeout, "")
+	text, messageID, rawResponse := streamResult.Text, streamResult.MessageID, streamResult.RawResponse
 	if err != nil {
 		return "", "", rawResponse, fmt.Errorf("%w; surf fallback stream parse failed: %v", upstreamErr, err)
 	}
@@ -818,6 +899,102 @@ func (g *NotionGateway) loadFinalAnswerWithPolling(ctx context.Context, account 
 	return "", "", fmt.Errorf("thread %s did not produce final assistant text after polling", strings.TrimSpace(threadID))
 }
 
+func (g *NotionGateway) loadCompletedFinalAnswerAfterIncompleteStream(ctx context.Context, account model.Account, threadID string, rawResponse string) (string, string, error) {
+	messageIDs := messageIDsFromRawNotionResponse(rawResponse, threadID)
+	result, err := g.loadCompletedFinalAnswerWithPolling(ctx, account, threadID, messageIDs)
+	return result.Text, result.MessageID, err
+}
+
+func (g *NotionGateway) loadCompletedFinalAnswerAfterCompletedStream(ctx context.Context, account model.Account, threadID string, streamResult notionTextStreamResult) (string, string, error) {
+	messageIDs := messageIDsFromRawNotionResponse(streamResult.RawResponse, threadID)
+	if streamMessageID := strings.TrimSpace(streamResult.MessageID); streamMessageID != "" {
+		messageIDs = prependUniqueString(messageIDs, streamMessageID)
+	}
+	if len(messageIDs) == 0 {
+		return "", "", fmt.Errorf("thread %s completed stream did not include assistant message ids", strings.TrimSpace(threadID))
+	}
+	syncCtx, cancel := context.WithTimeout(ctx, notionCompletedStreamVerifyTimeout)
+	defer cancel()
+	result, err := g.loadFinalAnswerFromMessageIDsDetailed(syncCtx, account, threadID, messageIDs)
+	if err == nil && strings.TrimSpace(result.Text) != "" && !result.Completed {
+		err = fmt.Errorf("thread %s synced assistant text is not completed message_id=%s", strings.TrimSpace(threadID), strings.TrimSpace(result.MessageID))
+		return "", result.MessageID, err
+	}
+	return result.Text, result.MessageID, err
+}
+
+func shouldUseSyncedCompletedAnswer(streamResult notionTextStreamResult, syncedText string, syncedMessageID string) bool {
+	syncedText = strings.TrimSpace(syncedText)
+	if syncedText == "" {
+		return false
+	}
+	streamText := strings.TrimSpace(streamResult.Text)
+	streamMessageID := strings.TrimSpace(streamResult.MessageID)
+	syncedMessageID = strings.TrimSpace(syncedMessageID)
+	if streamMessageID != "" && syncedMessageID != streamMessageID {
+		return false
+	}
+	if streamText == "" {
+		return true
+	}
+	return syncedText != streamText
+}
+
+func (g *NotionGateway) loadCompletedFinalAnswerWithPolling(ctx context.Context, account model.Account, threadID string, messageIDs []string) (notionFinalAnswerResult, error) {
+	rounds := g.cfg.Upstream.PollMaxRounds
+	if rounds <= 0 {
+		rounds = 8
+	}
+	if rounds > 8 {
+		rounds = 8
+	}
+	interval := time.Duration(g.cfg.Upstream.PollIntervalSeconds * float64(time.Second))
+	if interval <= 0 {
+		interval = 1500 * time.Millisecond
+	}
+	var latest notionFinalAnswerResult
+	var lastErr error
+	for attempt := 0; attempt <= rounds; attempt++ {
+		result, err := g.loadFinalAnswerDetailedOnceWithTimeout(ctx, account, threadID, messageIDs)
+		if strings.TrimSpace(result.Text) != "" {
+			latest = result
+			if result.Completed {
+				return result, nil
+			}
+		}
+		if err != nil {
+			lastErr = err
+		}
+		if attempt == rounds {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return notionFinalAnswerResult{}, ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+	if strings.TrimSpace(latest.Text) != "" {
+		return latest, fmt.Errorf("thread %s assistant text still incomplete after polling message_id=%s", strings.TrimSpace(threadID), strings.TrimSpace(latest.MessageID))
+	}
+	if lastErr != nil {
+		return notionFinalAnswerResult{}, lastErr
+	}
+	return notionFinalAnswerResult{}, fmt.Errorf("thread %s did not produce completed assistant text after polling", strings.TrimSpace(threadID))
+}
+
+func (g *NotionGateway) loadFinalAnswerDetailedOnceWithTimeout(ctx context.Context, account model.Account, threadID string, messageIDs []string) (notionFinalAnswerResult, error) {
+	syncCtx, cancel := context.WithTimeout(ctx, notionAnswerSyncTimeout)
+	defer cancel()
+	if len(messageIDs) > 0 {
+		result, err := g.loadFinalAnswerFromMessageIDsDetailed(syncCtx, account, threadID, messageIDs)
+		if strings.TrimSpace(result.Text) != "" || err == nil {
+			return result, err
+		}
+	}
+	return g.loadFinalAnswerOnceDetailed(syncCtx, account, threadID)
+}
+
 func (g *NotionGateway) loadFinalAnswerOnceWithTimeout(ctx context.Context, account model.Account, threadID string) (string, string, error) {
 	syncCtx, cancel := context.WithTimeout(ctx, notionAnswerSyncTimeout)
 	defer cancel()
@@ -825,47 +1002,45 @@ func (g *NotionGateway) loadFinalAnswerOnceWithTimeout(ctx context.Context, acco
 }
 
 func (g *NotionGateway) loadFinalAnswerOnce(ctx context.Context, account model.Account, threadID string) (string, string, error) {
+	result, err := g.loadFinalAnswerOnceDetailed(ctx, account, threadID)
+	return result.Text, result.MessageID, err
+}
+
+func (g *NotionGateway) loadFinalAnswerOnceDetailed(ctx context.Context, account model.Account, threadID string) (notionFinalAnswerResult, error) {
 	threadData, err := g.syncThread(ctx, account, threadID)
 	if err != nil {
-		return "", "", err
+		return notionFinalAnswerResult{}, err
 	}
 	recordMap := recordMapFromPayload(threadData)
 	messageIDs := messageIDsFromRecordMap(recordMap, threadID)
 	if len(messageIDs) == 0 {
-		return "", "", fmt.Errorf("thread %s did not produce any messages", strings.TrimSpace(threadID))
+		return notionFinalAnswerResult{}, fmt.Errorf("thread %s did not produce any messages", strings.TrimSpace(threadID))
 	}
-	messageData, err := g.syncThreadMessages(ctx, account, threadID, messageIDs)
-	if err != nil {
-		return "", "", err
-	}
-	recordMap = recordMapFromPayload(messageData)
-	if stepErr := finalErrorFromRecordMap(recordMap, threadID); stepErr != nil {
-		return "", "", stepErr
-	}
-	text, messageID := finalAgentFromRecordMap(recordMap, threadID)
-	if strings.TrimSpace(text) == "" {
-		return "", "", fmt.Errorf("thread %s did not produce any agent-inference message; message_ids=%v message_shapes=%v", strings.TrimSpace(threadID), messageIDs, summarizeThreadMessageShapes(recordMap, messageIDs))
-	}
-	return text, messageID, nil
+	return g.loadFinalAnswerFromMessageIDsDetailed(ctx, account, threadID, messageIDs)
 }
 
 func (g *NotionGateway) loadFinalAnswerFromMessageIDs(ctx context.Context, account model.Account, threadID string, messageIDs []string) (string, string, error) {
+	result, err := g.loadFinalAnswerFromMessageIDsDetailed(ctx, account, threadID, messageIDs)
+	return result.Text, result.MessageID, err
+}
+
+func (g *NotionGateway) loadFinalAnswerFromMessageIDsDetailed(ctx context.Context, account model.Account, threadID string, messageIDs []string) (notionFinalAnswerResult, error) {
 	if len(messageIDs) == 0 {
-		return "", "", fmt.Errorf("thread %s did not produce any message ids", strings.TrimSpace(threadID))
+		return notionFinalAnswerResult{}, fmt.Errorf("thread %s did not produce any message ids", strings.TrimSpace(threadID))
 	}
 	messageData, err := g.syncThreadMessages(ctx, account, threadID, messageIDs)
 	if err != nil {
-		return "", "", err
+		return notionFinalAnswerResult{}, err
 	}
 	recordMap := recordMapFromPayload(messageData)
 	if stepErr := finalErrorFromRecordMap(recordMap, threadID); stepErr != nil {
-		return "", "", stepErr
+		return notionFinalAnswerResult{}, stepErr
 	}
-	text, messageID := finalAgentFromRecordMap(recordMap, threadID)
+	text, messageID, completed := finalAgentFromRecordMapWithCompletion(recordMap, threadID)
 	if strings.TrimSpace(text) == "" {
-		return "", "", fmt.Errorf("thread %s did not produce any agent-inference message; message_ids=%v message_shapes=%v", strings.TrimSpace(threadID), messageIDs, summarizeThreadMessageShapes(recordMap, messageIDs))
+		return notionFinalAnswerResult{}, fmt.Errorf("thread %s did not produce any agent-inference message; message_ids=%v message_shapes=%v", strings.TrimSpace(threadID), messageIDs, summarizeThreadMessageShapes(recordMap, messageIDs))
 	}
-	return text, messageID, nil
+	return notionFinalAnswerResult{Text: text, MessageID: messageID, Completed: completed}, nil
 }
 
 func (g *NotionGateway) syncThread(ctx context.Context, account model.Account, threadID string) (map[string]any, error) {
@@ -1021,20 +1196,28 @@ func extractNotionText(raw []byte, threadID string) (string, string) {
 	return "", ""
 }
 
-const notionIdleAfterAnswerTimeout = 5 * time.Second
+const notionIdleAfterAnswerTimeout = 20 * time.Second
 const notionAnswerSyncTimeout = 10 * time.Second
+const notionCompletedStreamVerifyTimeout = 3 * time.Second
 
 type notionStreamReadEvent struct {
 	line []byte
 	err  error
 }
 
-func consumeNotionTextStream(reader io.ReadCloser, threadID string, idleAfterAnswer time.Duration) (string, string, string, error) {
+func consumeNotionTextStream(reader io.ReadCloser, threadID string, idleAfterAnswer time.Duration, requestID string) (notionTextStreamResult, error) {
 	state := &notionTranscriptState{ActiveAgentIndex: -1}
 	events := make(chan notionStreamReadEvent, 1)
 	done := make(chan struct{})
 	defer close(done)
 	defer reader.Close()
+	requestID = strings.TrimSpace(requestID)
+
+	slog.Info("notion sse receive start",
+		"request_id", requestID,
+		"thread_id", threadID,
+		"idle_after_ms", idleAfterAnswer.Milliseconds(),
+	)
 
 	go func() {
 		scanner := bufio.NewScanner(reader)
@@ -1063,6 +1246,7 @@ func consumeNotionTextStream(reader io.ReadCloser, threadID string, idleAfterAns
 	var raw bytes.Buffer
 	var bestText string
 	var messageID string
+	lineNumber := 0
 	var idleTimer *time.Timer
 	var idleC <-chan time.Time
 	defer func() {
@@ -1087,6 +1271,31 @@ func consumeNotionTextStream(reader io.ReadCloser, threadID string, idleAfterAns
 		}
 		idleC = idleTimer.C
 	}
+	result := func() notionTextStreamResult {
+		return notionTextStreamResult{
+			Text:        bestText,
+			MessageID:   messageID,
+			RawResponse: raw.String(),
+			Completed:   state.hasTerminalAnswer(),
+		}
+	}
+	logFinish := func(reason string, err error) {
+		attrs := []any{
+			"request_id", requestID,
+			"thread_id", threadID,
+			"reason", reason,
+			"lines", lineNumber,
+			"message_id", messageID,
+			"completed", state.hasTerminalAnswer(),
+			"text_chars", len([]rune(bestText)),
+			"text_preview", truncateRunes(collapseWhitespace(bestText), 240),
+			"raw_bytes", raw.Len(),
+		}
+		if err != nil {
+			attrs = append(attrs, "error", err)
+		}
+		slog.Info("notion sse receive finish", attrs...)
+	}
 
 	for {
 		select {
@@ -1099,36 +1308,98 @@ func consumeNotionTextStream(reader io.ReadCloser, threadID string, idleAfterAns
 					}
 				}
 				if event.err == io.EOF || (bestText != "" && state.hasTerminalAnswer()) {
-					return bestText, messageID, raw.String(), nil
+					logFinish("eof", nil)
+					return result(), nil
 				}
-				return "", "", raw.String(), event.err
+				logFinish("read_error", event.err)
+				return notionTextStreamResult{RawResponse: raw.String()}, event.err
 			}
 
+			lineNumber++
 			raw.Write(event.line)
 			raw.WriteByte('\n')
 			line := cleanNotionStreamLine(string(event.line))
-			if line == "" || line == "[DONE]" {
+			if line == "" {
+				logNotionSSEReceiveEvent(requestID, threadID, lineNumber, event.line, nil, "", "", bestText, messageID, state.hasTerminalAnswer(), "empty")
+				continue
+			}
+			if line == "[DONE]" {
+				logNotionSSEReceiveEvent(requestID, threadID, lineNumber, event.line, nil, "", "", bestText, messageID, state.hasTerminalAnswer(), "done")
 				continue
 			}
 			var payload any
 			if err := json.Unmarshal([]byte(line), &payload); err != nil {
+				logNotionSSEReceiveEvent(requestID, threadID, lineNumber, event.line, nil, "", "", bestText, messageID, state.hasTerminalAnswer(), "json_error:"+err.Error())
 				continue
 			}
 			text, id := state.handlePayload(payload, threadID)
 			if text = sanitizeNotionAssistantText(text); text != "" {
-				bestText = text
+				if shouldUseNotionStreamText(bestText, text) {
+					bestText = text
+				}
 				resetIdle()
 			}
 			if id != "" {
 				messageID = id
 			}
+			logNotionSSEReceiveEvent(requestID, threadID, lineNumber, event.line, payload, text, id, bestText, messageID, state.hasTerminalAnswer(), "")
 			if state.hasTerminalAnswer() {
-				return bestText, messageID, raw.String(), nil
+				logFinish("terminal", nil)
+				return result(), nil
 			}
 		case <-idleC:
-			return bestText, messageID, raw.String(), nil
+			logFinish("idle_after_answer", nil)
+			return result(), nil
 		}
 	}
+}
+
+func logNotionSSEReceiveEvent(requestID string, threadID string, lineNumber int, rawLine []byte, payload any, parsedText string, parsedMessageID string, bestText string, bestMessageID string, terminal bool, note string) {
+	eventType := notionStreamPayloadType(payload)
+	messageIDs := messageIDsFromNotionStreamPayload(payload)
+	attrs := []any{
+		"request_id", strings.TrimSpace(requestID),
+		"thread_id", strings.TrimSpace(threadID),
+		"line", lineNumber,
+		"event_type", eventType,
+		"line_bytes", len(rawLine),
+		"parsed_message_id", strings.TrimSpace(parsedMessageID),
+		"stream_message_ids", messageIDs,
+		"best_message_id", strings.TrimSpace(bestMessageID),
+		"parsed_text_chars", len([]rune(parsedText)),
+		"parsed_text_preview", truncateRunes(collapseWhitespace(parsedText), 180),
+		"best_text_chars", len([]rune(bestText)),
+		"best_text_preview", truncateRunes(collapseWhitespace(bestText), 180),
+		"terminal", terminal,
+		"raw_preview", truncateRunes(cleanNotionStreamLine(string(rawLine)), 700),
+	}
+	if note != "" {
+		attrs = append(attrs, "note", note)
+	}
+	slog.Info("notion sse receive event", attrs...)
+}
+
+func notionStreamPayloadType(payload any) string {
+	item := mapFromAny(payload)
+	if item == nil {
+		return ""
+	}
+	return firstNonEmpty(stringFromAny(item["type"]), stringFromAny(item["event"]), stringFromAny(item["kind"]))
+}
+
+func shouldUseNotionStreamText(current string, candidate string) bool {
+	candidate = sanitizeNotionAssistantText(candidate)
+	if candidate == "" {
+		return false
+	}
+	current = sanitizeNotionAssistantText(current)
+	if current == "" {
+		return true
+	}
+	if len([]rune(candidate)) >= len([]rune(current)) {
+		return true
+	}
+	return !strings.Contains(current, candidate)
 }
 
 func cleanNotionStreamLine(line string) string {
@@ -1158,16 +1429,20 @@ func (s *notionTranscriptState) handlePayload(value any, threadID string) (strin
 	case "agent-inference":
 		s.mergeAgentInference(typed)
 	case "record-map":
-		if text, id := finalAgentFromRecordMap(recordMapFromPayload(typed), threadID); text != "" {
+		if text, id, completed := finalAgentFromRecordMapWithCompletion(recordMapFromPayload(typed), threadID); text != "" {
 			s.FinalText = text
 			s.MessageID = id
-			s.terminal = true
+			if completed {
+				s.terminal = true
+			}
 		}
 	default:
-		if text, id := finalAgentFromRecordMap(recordMapFromPayload(typed), threadID); text != "" {
+		if text, id, completed := finalAgentFromRecordMapWithCompletion(recordMapFromPayload(typed), threadID); text != "" {
 			s.FinalText = text
 			s.MessageID = id
-			s.terminal = true
+			if completed {
+				s.terminal = true
+			}
 		}
 	}
 	return s.result()
@@ -1244,9 +1519,7 @@ func (s *notionTranscriptState) stepStateFromMap(stepMap map[string]any) notionS
 	switch step.Type {
 	case "agent-inference":
 		step.Text = extractAssistantStepText(stepMap["value"])
-		if step.Text != "" {
-			step.Completed = true
-		}
+		step.Completed = notionStepHasCompletionSignal(stepMap)
 	case "markdown-chat":
 		step.Text = strings.TrimSpace(stringFromAny(stepMap["value"]))
 		if step.Text != "" {
@@ -1254,6 +1527,42 @@ func (s *notionTranscriptState) stepStateFromMap(stepMap map[string]any) notionS
 		}
 	}
 	return step
+}
+
+func notionStepHasCompletionSignal(stepMap map[string]any) bool {
+	if stepMap == nil {
+		return false
+	}
+	return notionMapHasCompletionSignal(stepMap)
+}
+
+func notionPatchRestMarksStepCompleted(rest string, rawValue any) bool {
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return false
+	}
+	switch rest {
+	case "/completed", "/data/completed":
+		completed, ok := boolFromAny(rawValue)
+		return ok && completed
+	case "/status", "/state", "/data/status", "/data/state":
+		return isNotionCompletedStatus(stringFromAny(rawValue))
+	case "/finishedAt", "/finished_at", "/completedAt", "/completed_at", "/completed_time", "/data/finishedAt", "/data/finished_at", "/data/completedAt", "/data/completed_at", "/data/completed_time":
+		return stringFromAny(rawValue) != ""
+	}
+	if strings.HasSuffix(rest, "/completed") {
+		completed, ok := boolFromAny(rawValue)
+		return ok && completed
+	}
+	if strings.HasSuffix(rest, "/status") || strings.HasSuffix(rest, "/state") {
+		return isNotionCompletedStatus(stringFromAny(rawValue))
+	}
+	for _, suffix := range []string{"/finishedAt", "/finished_at", "/completedAt", "/completed_at", "/completed_time"} {
+		if strings.HasSuffix(rest, suffix) {
+			return stringFromAny(rawValue) != ""
+		}
+	}
+	return false
 }
 
 func (s *notionTranscriptState) applyPatchOperations(rawOps []any) {
@@ -1303,12 +1612,8 @@ func (s *notionTranscriptState) applyPatchOperation(opType string, path string, 
 			}
 			return
 		}
-		if s.Steps[index].Type == "agent-inference" && rest == "/finishedAt" {
-			s.Steps[index].Completed = true
-			s.ActiveAgentIndex = index
-			if text, _ := s.result(); text != "" {
-				s.terminal = true
-			}
+		if s.Steps[index].Type == "agent-inference" && notionPatchRestMarksStepCompleted(rest, rawValue) {
+			s.markStepCompleted(index)
 			return
 		}
 		if s.Steps[index].Type == "agent-inference" {
@@ -1320,11 +1625,21 @@ func (s *notionTranscriptState) applyPatchOperation(opType string, path string, 
 			return
 		}
 		s.ensureStepIndex(index)
-		if text := stringFromAny(rawValue); text != "" && (rest == "/value" || strings.HasPrefix(rest, "/value/")) {
+		if text := stringFromAny(rawValue); text != "" && rest == "/value" {
 			s.appendStepTextFromPatch(index, text)
 			return
 		}
+		if text := stringFromAny(rawValue); text != "" && strings.HasPrefix(rest, "/value/") {
+			if index >= len(s.Steps) || s.Steps[index].Type == "markdown-chat" {
+				s.appendStepTextFromPatch(index, text)
+				return
+			}
+		}
 		if index >= len(s.Steps) || s.Steps[index].Type != "agent-inference" {
+			return
+		}
+		if notionPatchRestMarksStepCompleted(rest, rawValue) {
+			s.markStepCompleted(index)
 			return
 		}
 		s.applyAgentPatchField(index, rest, opType, rawValue)
@@ -1337,6 +1652,17 @@ func (s *notionTranscriptState) applyPatchOperation(opType string, path string, 
 			s.removePatchValueEntry(index, valueIndex)
 			s.refreshAgentStepFromPatchState(index)
 		}
+	}
+}
+
+func (s *notionTranscriptState) markStepCompleted(index int) {
+	if index < 0 || index >= len(s.Steps) {
+		return
+	}
+	s.Steps[index].Completed = true
+	s.ActiveAgentIndex = index
+	if text, _ := s.result(); text != "" {
+		s.terminal = true
 	}
 }
 
@@ -1600,12 +1926,16 @@ func notionPatchStateEntryKey(statePrefix string, valueIndex int) string {
 }
 
 func normalizeNotionPatchEntryType(value string) string {
-	switch strings.TrimSpace(strings.ToLower(value)) {
-	case "text":
+	normalized := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(value, "_", "-")))
+	switch normalized {
+	case "text", "markdown", "markdown-chat", "paragraph", "heading", "heading-1", "heading-2", "heading-3", "sub-header", "sub-sub-header", "code", "quote", "callout", "bulleted-list", "bulleted-list-item", "numbered-list", "numbered-list-item", "to-do", "toggle", "list", "list-item", "table", "table-row":
 		return "text"
 	case "thinking", "reasoning":
 		return "reasoning"
 	default:
+		if strings.Contains(normalized, "text") || strings.Contains(normalized, "markdown") || strings.Contains(normalized, "content") {
+			return "text"
+		}
 		return ""
 	}
 }
@@ -1647,17 +1977,23 @@ func recordMapFromPayload(payload map[string]any) map[string]any {
 }
 
 func finalAgentFromRecordMap(recordMap map[string]any, threadID string) (string, string) {
+	text, messageID, _ := finalAgentFromRecordMapWithCompletion(recordMap, threadID)
+	return text, messageID
+}
+
+func finalAgentFromRecordMapWithCompletion(recordMap map[string]any, threadID string) (string, string, bool) {
 	if recordMap == nil {
-		return "", ""
+		return "", "", false
 	}
 	agents := extractAgentMessagesFromRecordMap(recordMap)
 	if len(agents) == 0 {
-		return "", ""
+		return "", "", false
 	}
+	completed := extractAgentMessageCompletionFromRecordMap(recordMap)
 	messageIDs := messageIDsFromRecordMap(recordMap, threadID)
 	for i := len(messageIDs) - 1; i >= 0; i-- {
 		if text := sanitizeNotionAssistantText(agents[messageIDs[i]]); text != "" {
-			return text, messageIDs[i]
+			return text, messageIDs[i], completed[messageIDs[i]]
 		}
 	}
 	keys := make([]string, 0, len(agents))
@@ -1667,10 +2003,10 @@ func finalAgentFromRecordMap(recordMap map[string]any, threadID string) (string,
 	sort.Strings(keys)
 	for i := len(keys) - 1; i >= 0; i-- {
 		if text := sanitizeNotionAssistantText(agents[keys[i]]); text != "" {
-			return text, keys[i]
+			return text, keys[i], completed[keys[i]]
 		}
 	}
-	return "", ""
+	return "", "", false
 }
 
 func finalErrorFromRecordMap(recordMap map[string]any, threadID string) error {
@@ -1854,6 +2190,74 @@ func extractAgentMessagesFromRecordMap(recordMap map[string]any) map[string]stri
 	return out
 }
 
+func extractAgentMessageCompletionFromRecordMap(recordMap map[string]any) map[string]bool {
+	out := map[string]bool{}
+	for messageID, rawItem := range mapFromAny(recordMap["thread_message"]) {
+		value, valueWrapper := threadMessageRecordValue(rawItem)
+		step := stepFromThreadMessageRecord(rawItem)
+		if step == nil && value == nil {
+			continue
+		}
+		out[messageID] = notionThreadMessageCompleted(mapFromAny(rawItem), valueWrapper, value, step)
+	}
+	return out
+}
+
+func notionThreadMessageCompleted(rawItem map[string]any, valueWrapper map[string]any, value map[string]any, step map[string]any) bool {
+	if notionMapHasCompletionSignal(step) ||
+		notionMapHasCompletionSignal(value) ||
+		notionMapHasCompletionSignal(valueWrapper) ||
+		notionMapHasCompletionSignal(rawItem) {
+		return true
+	}
+	if strings.TrimSpace(stringFromAny(step["type"])) == "markdown-chat" && strings.TrimSpace(assistantTextFromStep(step)) != "" {
+		return true
+	}
+	return false
+}
+
+func notionMapHasCompletionSignal(value map[string]any) bool {
+	if value == nil {
+		return false
+	}
+	if notionMapHasDirectCompletionSignal(value) {
+		return true
+	}
+	return notionMapHasDirectCompletionSignal(mapFromAny(value["data"]))
+}
+
+func notionMapHasDirectCompletionSignal(value map[string]any) bool {
+	if value == nil {
+		return false
+	}
+	for _, key := range []string{"completed", "complete", "done"} {
+		if completed, ok := boolFromAny(value[key]); ok && completed {
+			return true
+		}
+	}
+	for _, key := range []string{"status", "state"} {
+		if isNotionCompletedStatus(stringFromAny(value[key])) {
+			return true
+		}
+	}
+	for _, key := range []string{"finishedAt", "finished_at", "completedAt", "completed_at", "completed_time"} {
+		if stringFromAny(value[key]) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func isNotionCompletedStatus(status string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(status, "_", "-")))
+	switch normalized {
+	case "complete", "completed", "done", "success", "succeeded", "finished":
+		return true
+	default:
+		return false
+	}
+}
+
 func extractInferenceErrorsFromRecordMap(recordMap map[string]any, threadID string) map[string]NotionInferenceStepError {
 	out := map[string]NotionInferenceStepError{}
 	for messageID, rawItem := range mapFromAny(recordMap["thread_message"]) {
@@ -1957,11 +2361,16 @@ func isAssistantStepType(stepType string) bool {
 	if normalized == "" {
 		return false
 	}
+	if strings.Contains(normalized, "tool") ||
+		strings.Contains(normalized, "instruction") ||
+		strings.Contains(normalized, "turn-full-record-map") {
+		return false
+	}
 	switch normalized {
-	case "agent-inference", "markdown-chat", "assistant", "assistant-message", "assistant-response", "ai-response", "ai-message":
+	case "agent", "agent-inference", "agent-message", "agent-response", "markdown-chat", "assistant", "assistant-message", "assistant-response", "ai-response", "ai-message":
 		return true
 	default:
-		return strings.Contains(normalized, "assistant") || strings.Contains(normalized, "agent")
+		return strings.Contains(normalized, "assistant")
 	}
 }
 
@@ -1993,10 +2402,18 @@ func extractAssistantStepText(value any) string {
 		text := ""
 		for _, rawPart := range parts {
 			part := mapFromAny(rawPart)
-			if normalizeNotionPatchEntryType(stringFromAny(part["type"])) != "text" {
+			if part == nil {
+				if content := extractAssistantPartContent(rawPart); content != "" {
+					text = combineAgentContentParts(text, content)
+				}
 				continue
 			}
-			text = combineAgentContentParts(text, extractAssistantPartContent(part))
+			if normalizeNotionPatchEntryType(stringFromAny(part["type"])) == "reasoning" {
+				continue
+			}
+			if content := extractAssistantPartContent(part); content != "" {
+				text = combineAgentContentParts(text, content)
+			}
 		}
 		return strings.TrimSpace(text)
 	}
@@ -2021,7 +2438,11 @@ func extractAssistantPartContent(value any) string {
 	if len(parts) == 0 {
 		return ""
 	}
-	return strings.TrimSpace(strings.Join(parts, ""))
+	joined := strings.Join(parts, "")
+	if strings.TrimSpace(joined) == "" {
+		return ""
+	}
+	return joined
 }
 
 func collectAssistantContentLeaves(value any, out *[]string) {
@@ -2039,11 +2460,35 @@ func collectAssistantContentLeaves(value any, out *[]string) {
 			collectAssistantContentLeaves(item, out)
 		}
 	case map[string]any:
-		for _, key := range []string{"content", "text", "title", "label", "value"} {
+		if plain, ok := plainTextFromNotionMap(typed); ok {
+			*out = append(*out, plain)
+			return
+		}
+		before := len(*out)
+		for _, key := range []string{"content", "text", "richText", "rich_text", "title", "label", "value"} {
 			if nested, ok := typed[key]; ok {
 				collectAssistantContentLeaves(nested, out)
 			}
 		}
+		if len(*out) > before {
+			return
+		}
+		for key, nested := range typed {
+			if shouldSkipAssistantContentKey(key) {
+				continue
+			}
+			collectAssistantContentLeaves(nested, out)
+		}
+	}
+}
+
+func shouldSkipAssistantContentKey(key string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(key, "_", "-")))
+	switch normalized {
+	case "", "type", "id", "name", "role", "status", "state", "href", "url", "uri", "link", "links", "color", "annotations", "annotation", "format", "metadata", "created-at", "updated-at", "last-edited-time", "space-id", "table", "content-type", "mime-type", "file-url", "download-name", "permission-record", "source":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -2267,12 +2712,32 @@ func collectStringLeaves(value any, out *[]string) {
 			collectStringLeaves(item, out)
 		}
 	case map[string]any:
-		for _, key := range []string{"content", "text", "title", "label", "value"} {
+		if plain, ok := plainTextFromNotionMap(typed); ok {
+			*out = append(*out, plain)
+			return
+		}
+		for _, key := range []string{"content", "text", "richText", "rich_text", "title", "label", "value"} {
 			if nested, ok := typed[key]; ok {
 				collectStringLeaves(nested, out)
 			}
 		}
 	}
+}
+
+func plainTextFromNotionMap(value map[string]any) (string, bool) {
+	for _, key := range []string{"plainText", "plain_text"} {
+		switch typed := value[key].(type) {
+		case string:
+			if typed != "" {
+				return typed, true
+			}
+		default:
+			if text := stringFromAny(typed); text != "" {
+				return text, true
+			}
+		}
+	}
+	return "", false
 }
 
 func timeFromTranscriptValue(value any) time.Time {
@@ -2540,6 +3005,9 @@ func messageIDsFromRawNotionResponse(raw string, threadID string) []string {
 		if err := json.Unmarshal([]byte(line), &payload); err != nil {
 			continue
 		}
+		for _, messageID := range messageIDsFromNotionStreamPayload(payload) {
+			appendID(messageID)
+		}
 		for _, messageID := range messageIDsFromRecordMap(recordMapFromPayload(mapFromAny(payload)), threadID) {
 			appendID(messageID)
 		}
@@ -2547,10 +3015,66 @@ func messageIDsFromRawNotionResponse(raw string, threadID string) []string {
 	if len(out) == 0 && strings.TrimSpace(raw) != "" {
 		var payload any
 		if err := json.Unmarshal([]byte(raw), &payload); err == nil {
+			for _, messageID := range messageIDsFromNotionStreamPayload(payload) {
+				appendID(messageID)
+			}
 			for _, messageID := range messageIDsFromRecordMap(recordMapFromPayload(mapFromAny(payload)), threadID) {
 				appendID(messageID)
 			}
 		}
+	}
+	return out
+}
+
+func messageIDsFromNotionStreamPayload(payload any) []string {
+	item := mapFromAny(payload)
+	if item == nil {
+		return nil
+	}
+	out := []string{}
+	appendStepID := func(step map[string]any) {
+		if step == nil {
+			return
+		}
+		stepType := strings.TrimSpace(stringFromAny(step["type"]))
+		if stepType != "markdown-chat" && !isAssistantStepType(stepType) {
+			return
+		}
+		if messageID := strings.TrimSpace(stringFromAny(step["id"])); messageID != "" {
+			out = append(out, messageID)
+		}
+	}
+	switch strings.TrimSpace(stringFromAny(item["type"])) {
+	case "agent-inference", "markdown-chat":
+		appendStepID(item)
+	case "patch-start":
+		for _, rawStep := range sliceFromAny(mapFromAny(item["data"])["s"]) {
+			appendStepID(mapFromAny(rawStep))
+		}
+	case "patch":
+		for _, rawOp := range sliceFromAny(item["v"]) {
+			op := mapFromAny(rawOp)
+			if strings.TrimSpace(stringFromAny(op["p"])) == "/s/-" {
+				appendStepID(mapFromAny(op["v"]))
+			}
+		}
+	}
+	return out
+}
+
+func prependUniqueString(values []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return values
+	}
+	out := make([]string, 0, len(values)+1)
+	out = append(out, value)
+	for _, existing := range values {
+		existing = strings.TrimSpace(existing)
+		if existing == "" || existing == value {
+			continue
+		}
+		out = append(out, existing)
 	}
 	return out
 }

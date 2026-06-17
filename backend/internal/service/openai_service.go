@@ -38,6 +38,25 @@ type CompletionResult struct {
 	Trace   map[string]any
 }
 
+type OpenAIRequestOptions struct {
+	APIKeyID             uint
+	RequestID            string
+	HeaderSessionID      string
+	HeaderConversationID string
+}
+
+type stickySessionKey struct {
+	Key    string
+	Source string
+}
+
+type accountSelection struct {
+	Account   model.Account
+	StickyHit bool
+	ThreadID  string
+	Source    string
+}
+
 type hiddenPromptMessage struct {
 	Role    string
 	Content string
@@ -54,6 +73,10 @@ type pendingResponseContext struct {
 
 var (
 	codexMarkdownFileLinkPattern = regexp.MustCompile(`\[([^\]\n]{1,512})\]\(([^)\s]+)\)`)
+	codexPlainFileRefPattern     = regexp.MustCompile(`(?:^|[\s"'` + "`" + `([{<，。！？、：；,;:!?])([A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)*|Dockerfile|Makefile|compose\.ya?ml|docker-compose\.ya?ml)(?:$|[\s"'` + "`" + `)\]}>，。！？、：；,;:!?])`)
+	codexQuotedFilesPattern      = regexp.MustCompile(`(?i)"files"\s*:\s*\[([^\]]*)\]`)
+	codexQuotedFilePattern       = regexp.MustCompile(`(?i)"file"\s*:\s*"([^"]{1,512})"`)
+	codexJSONStringPattern       = regexp.MustCompile(`"([^"\\]*(?:\\.[^"\\]*)*)"`)
 	pendingResponseContexts      sync.Map
 )
 
@@ -86,16 +109,19 @@ func (s *OpenAIService) Model(ctx context.Context, id string) (dto.ModelDTO, err
 	return ModelDTO(row), nil
 }
 
-func (s *OpenAIService) ChatCompletion(ctx context.Context, req dto.ChatCompletionRequest) (CompletionResult, error) {
+func (s *OpenAIService) ChatCompletion(ctx context.Context, req dto.ChatCompletionRequest, opts ...OpenAIRequestOptions) (CompletionResult, error) {
+	options := mergeOpenAIRequestOptions(opts...)
 	row, err := s.models.Resolve(ctx, req.Model)
 	if err != nil {
 		return CompletionResult{}, err
 	}
 	threadID := firstNonEmpty(req.ThreadID, req.Thread, req.NotionThreadID, stringFromMetadata(req.Metadata, "thread_id", "notion_thread_id"))
-	account, stickyHit, err := s.selectAccountForThread(ctx, requestedAccountEmail(req.AccountEmail, req.NotionAccountEmail, req.Metadata), threadID)
+	sessionKeys := chatStickySessionKeys(req, options)
+	selection, err := s.selectAccountForStickyKeys(ctx, requestedAccountEmail(req.AccountEmail, req.NotionAccountEmail, req.Metadata), threadID, sessionKeys)
 	if err != nil {
 		return CompletionResult{}, err
 	}
+	account := selection.Account
 	prompt, hiddenPrompt, hiddenMessages := normalizeChatMessages(req.Messages)
 	hiddenPrompt = appendResponseFormatInstruction(hiddenPrompt, req.ResponseFormat)
 	notionPrompt := prependHiddenPromptInstructionEnvelope(prompt, hiddenPrompt)
@@ -109,11 +135,13 @@ func (s *OpenAIService) ChatCompletion(ctx context.Context, req dto.ChatCompleti
 		Prompt:           notionPrompt,
 		HiddenPrompt:     hiddenPrompt,
 		HiddenMessages:   hiddenMessages,
+		Attachments:      chatCompletionAttachmentUploads(req),
+		RequestID:        options.RequestID,
 		PublicModel:      row.PublicID,
 		NotionModel:      row.NotionModel,
 		UseWebSearch:     useWebSearch,
 		ConversationID:   firstNonEmpty(req.ConversationID, req.Conversation, stringFromMetadata(req.Metadata, "conversation_id", "notion_conversation_id")),
-		UpstreamThreadID: threadID,
+		UpstreamThreadID: selection.ThreadID,
 		RawMessageCount:  len(req.Messages),
 	}
 	account, notionResult, err := s.runPromptWithHealth(ctx, account, notionReq)
@@ -122,7 +150,7 @@ func (s *OpenAIService) ChatCompletion(ctx context.Context, req dto.ChatCompleti
 		return CompletionResult{}, err
 	}
 	s.accounts.MarkSuccess(ctx, account.ID)
-	s.bindStickyThread(ctx, account, notionResult)
+	s.bindStickyThread(ctx, account, notionResult, sessionKeys, "", options.APIKeyID)
 	answer := notionResult.Text
 	promptTokens := security.EstimateTokens(firstNonEmpty(notionPrompt, prompt, hiddenPrompt))
 	completionTokens := security.EstimateTokens(answer)
@@ -158,14 +186,16 @@ func (s *OpenAIService) ChatCompletion(ctx context.Context, req dto.ChatCompleti
 			"thread_id":      notionResult.ThreadID,
 			"message_id":     notionResult.MessageID,
 			"converted_only": notionResult.ConvertedOnly,
-			"sticky_session": stickyHit,
+			"sticky_session": selection.StickyHit,
+			"sticky_source":  selection.Source,
 			"request":        notionResult.Payload,
 		},
 	}
 	return CompletionResult{Payload: payload, Usage: usage, Model: row.PublicID, Text: answer, Trace: payload["notion_trace"].(map[string]any)}, nil
 }
 
-func (s *OpenAIService) Response(ctx context.Context, body map[string]any) (CompletionResult, error) {
+func (s *OpenAIService) Response(ctx context.Context, body map[string]any, opts ...OpenAIRequestOptions) (CompletionResult, error) {
+	options := mergeOpenAIRequestOptions(opts...)
 	raw, _ := json.Marshal(body)
 	modelName, _ := body["model"].(string)
 	row, err := s.models.Resolve(ctx, modelName)
@@ -174,12 +204,15 @@ func (s *OpenAIService) Response(ctx context.Context, body map[string]any) (Comp
 	}
 	threadID := firstNonEmpty(stringFromAny(body["thread_id"]), stringFromAny(body["thread"]), stringFromAny(body["notion_thread_id"]), stringFromMetadata(body["metadata"], "thread_id", "notion_thread_id"))
 	if result, ok := maybeBuildCodexFileToolCallResult(row.PublicID, body); ok {
+		logCodexToolCallConversion(options, result)
 		return result, nil
 	}
-	account, stickyHit, err := s.selectAccountForThread(ctx, requestedAccountEmailFromMap(body), threadID)
+	sessionKeys := responseStickySessionKeys(body, options)
+	selection, err := s.selectAccountForStickyKeys(ctx, requestedAccountEmailFromMap(body), threadID, sessionKeys)
 	if err != nil {
 		return CompletionResult{}, err
 	}
+	account := selection.Account
 	prompt, hiddenPrompt, hiddenMessages := responsesPromptPartsFromBody(body)
 	notionPrompt := prependHiddenPromptInstructionEnvelope(prompt, hiddenPrompt)
 	useWebSearch := s.cfg.Features.WebSearch
@@ -192,11 +225,13 @@ func (s *OpenAIService) Response(ctx context.Context, body map[string]any) (Comp
 		Prompt:           notionPrompt,
 		HiddenPrompt:     hiddenPrompt,
 		HiddenMessages:   hiddenMessages,
+		Attachments:      responsesAttachmentUploadsFromBody(body),
+		RequestID:        options.RequestID,
 		PublicModel:      row.PublicID,
 		NotionModel:      row.NotionModel,
 		UseWebSearch:     useWebSearch,
 		ConversationID:   firstNonEmpty(stringFromAny(body["conversation_id"]), stringFromAny(body["conversation"]), stringFromMetadata(body["metadata"], "conversation_id", "notion_conversation_id")),
-		UpstreamThreadID: threadID,
+		UpstreamThreadID: selection.ThreadID,
 		RawMessageCount:  1,
 	}
 	account, notionResult, err := s.runPromptWithHealth(ctx, account, notionReq)
@@ -205,8 +240,15 @@ func (s *OpenAIService) Response(ctx context.Context, body map[string]any) (Comp
 		return CompletionResult{}, err
 	}
 	s.accounts.MarkSuccess(ctx, account.ID)
-	s.bindStickyThread(ctx, account, notionResult)
 	answer := notionResult.Text
+	slog.Info("responses extracted notion answer",
+		"request_id", options.RequestID,
+		"model", row.PublicID,
+		"thread_id", notionResult.ThreadID,
+		"message_id", notionResult.MessageID,
+		"answer_chars", utf8.RuneCountInString(answer),
+		"answer_preview", truncateRunes(collapseWhitespace(answer), 180),
+	)
 	promptTokens := security.EstimateTokens(firstNonEmpty(notionPrompt, prompt, hiddenPrompt, string(raw)))
 	completionTokens := security.EstimateTokens(answer)
 	usage := dto.UsageDTO{
@@ -216,16 +258,51 @@ func (s *OpenAIService) Response(ctx context.Context, body map[string]any) (Comp
 		Estimated:        true,
 	}
 	createdAt := time.Now().Unix()
+	responseID := newResponsesID("resp")
 	trace := map[string]any{
 		"account_email":  account.Email,
 		"thread_id":      notionResult.ThreadID,
 		"message_id":     notionResult.MessageID,
 		"converted_only": notionResult.ConvertedOnly,
-		"sticky_session": stickyHit,
+		"sticky_session": selection.StickyHit,
+		"sticky_source":  selection.Source,
 		"request":        notionResult.Payload,
 	}
-	payload := buildResponsesPayload(row.PublicID, answer, usage, newResponsesID("resp"), newResponsesID("msg"), createdAt, body, trace)
+	if toolResult, ok := maybeBuildCodexAssistantTextToolCallResult(row.PublicID, body, answer, trace); ok {
+		if responseID := stringFromAny(toolResult.Payload["id"]); responseID != "" {
+			s.bindStickyThread(ctx, account, notionResult, sessionKeys, responseID, options.APIKeyID)
+		}
+		logCodexToolCallConversion(options, toolResult)
+		return toolResult, nil
+	}
+	s.bindStickyThread(ctx, account, notionResult, sessionKeys, responseID, options.APIKeyID)
+	payload := buildResponsesPayload(row.PublicID, answer, usage, responseID, newResponsesID("msg"), createdAt, body, trace)
 	return CompletionResult{Payload: payload, Usage: usage, Model: row.PublicID, Text: answer, Trace: payload["notion_trace"].(map[string]any)}, nil
+}
+
+func (s *OpenAIService) selectAccountForStickyKeys(ctx context.Context, preferredEmail string, threadID string, sessionKeys []stickySessionKey) (accountSelection, error) {
+	threadID = strings.TrimSpace(threadID)
+	preferredEmail = strings.TrimSpace(preferredEmail)
+	if threadID != "" {
+		account, stickyHit, err := s.selectAccountForThread(ctx, preferredEmail, threadID)
+		return accountSelection{Account: account, StickyHit: stickyHit, ThreadID: threadID, Source: stickySource(stickyHit, "thread_id")}, err
+	}
+	if s.sticky != nil {
+		for _, key := range sessionKeys {
+			if key.Key == "" {
+				continue
+			}
+			selection, ok, err := s.selectAccountForBindingKey(ctx, preferredEmail, key)
+			if err != nil {
+				return accountSelection{}, err
+			}
+			if ok {
+				return selection, nil
+			}
+		}
+	}
+	account, err := s.accounts.Select(ctx, preferredEmail)
+	return accountSelection{Account: account}, err
 }
 
 func (s *OpenAIService) selectAccountForThread(ctx context.Context, preferredEmail string, threadID string) (model.Account, bool, error) {
@@ -263,7 +340,39 @@ func (s *OpenAIService) selectAccountForThread(ctx context.Context, preferredEma
 	return account, true, nil
 }
 
-func (s *OpenAIService) bindStickyThread(ctx context.Context, account model.Account, result NotionRunResult) {
+func (s *OpenAIService) selectAccountForBindingKey(ctx context.Context, preferredEmail string, key stickySessionKey) (accountSelection, bool, error) {
+	binding, ok, err := s.sticky.Get(ctx, key.Key)
+	if err != nil {
+		slog.Warn("sticky session lookup failed", "sticky_key", key.Source, "error", err)
+		return accountSelection{}, false, nil
+	}
+	if !ok || binding.AccountID == 0 {
+		return accountSelection{}, false, nil
+	}
+	account, err := s.accounts.Get(ctx, binding.AccountID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			_ = s.sticky.Delete(ctx, key.Key)
+			return accountSelection{}, false, nil
+		}
+		return accountSelection{}, false, err
+	}
+	if !account.Enabled {
+		_ = s.sticky.Delete(ctx, key.Key)
+		return accountSelection{}, false, nil
+	}
+	if preferredEmail != "" && !strings.EqualFold(account.Email, preferredEmail) {
+		return accountSelection{}, false, fmt.Errorf("%w: session %s is bound to account %s, not %s", ErrConflict, key.Source, account.Email, preferredEmail)
+	}
+	return accountSelection{
+		Account:   account,
+		StickyHit: true,
+		ThreadID:  strings.TrimSpace(binding.ThreadID),
+		Source:    key.Source,
+	}, true, nil
+}
+
+func (s *OpenAIService) bindStickyThread(ctx context.Context, account model.Account, result NotionRunResult, sessionKeys []stickySessionKey, responseID string, apiKeyID uint) {
 	if s.sticky == nil || account.ID == 0 || result.ConvertedOnly {
 		return
 	}
@@ -272,6 +381,7 @@ func (s *OpenAIService) bindStickyThread(ctx context.Context, account model.Acco
 		return
 	}
 	err := s.sticky.Set(ctx, StickyThreadBinding{
+		StickyKey:    threadID,
 		ThreadID:     threadID,
 		AccountID:    account.ID,
 		AccountEmail: account.Email,
@@ -281,6 +391,115 @@ func (s *OpenAIService) bindStickyThread(ctx context.Context, account model.Acco
 	if err != nil {
 		slog.Warn("sticky session bind failed", "thread_id", threadID, "account_id", account.ID, "error", err)
 	}
+	binding := StickyThreadBinding{
+		ThreadID:     threadID,
+		AccountID:    account.ID,
+		AccountEmail: account.Email,
+		SpaceID:      account.SpaceID,
+		SpaceViewID:  account.SpaceViewID,
+	}
+	for _, key := range appendUniqueStickyKeys(sessionKeys, []stickySessionKey{{Key: responseStickyKey(apiKeyID, responseID), Source: "response_id"}}) {
+		if key.Key == "" {
+			continue
+		}
+		binding.StickyKey = key.Key
+		if err := s.sticky.Set(ctx, binding, stickyTTL(s.cfg.Sticky)); err != nil {
+			slog.Warn("sticky session bind failed", "sticky_source", key.Source, "account_id", account.ID, "error", err)
+		}
+	}
+}
+
+func stickySource(hit bool, source string) string {
+	if !hit {
+		return ""
+	}
+	return source
+}
+
+func mergeOpenAIRequestOptions(opts ...OpenAIRequestOptions) OpenAIRequestOptions {
+	if len(opts) == 0 {
+		return OpenAIRequestOptions{}
+	}
+	return opts[0]
+}
+
+func logCodexToolCallConversion(opts OpenAIRequestOptions, result CompletionResult) {
+	toolCall := mapFromAny(result.Trace["tool_call"])
+	if toolCall == nil {
+		return
+	}
+	slog.Info("responses converted to codex tool call",
+		"request_id", opts.RequestID,
+		"model", result.Model,
+		"response_id", stringFromAny(result.Payload["id"]),
+		"tool_name", stringFromAny(toolCall["name"]),
+		"reason", stringFromAny(toolCall["reason"]),
+		"arguments", toolCall["arguments"],
+	)
+}
+
+func chatStickySessionKeys(req dto.ChatCompletionRequest, opts OpenAIRequestOptions) []stickySessionKey {
+	return appendUniqueStickyKeys([]stickySessionKey{
+		clientStickyKey(opts.APIKeyID, "header_session_id", opts.HeaderSessionID),
+		clientStickyKey(opts.APIKeyID, "header_conversation_id", opts.HeaderConversationID),
+		clientStickyKey(opts.APIKeyID, "prompt_cache_key", req.PromptCacheKey),
+		clientStickyKey(opts.APIKeyID, "metadata_session_id", stringFromMetadata(req.Metadata, "session_id", "notion_session_id")),
+		clientStickyKey(opts.APIKeyID, "conversation_id", firstNonEmpty(req.ConversationID, req.Conversation)),
+		clientStickyKey(opts.APIKeyID, "metadata_conversation_id", stringFromMetadata(req.Metadata, "conversation_id", "notion_conversation_id")),
+		clientStickyKey(opts.APIKeyID, "user", req.User),
+	})
+}
+
+func responseStickySessionKeys(body map[string]any, opts OpenAIRequestOptions) []stickySessionKey {
+	metadata := body["metadata"]
+	return appendUniqueStickyKeys([]stickySessionKey{
+		{Key: responseStickyKey(opts.APIKeyID, stringFromAny(body["previous_response_id"])), Source: "previous_response_id"},
+		clientStickyKey(opts.APIKeyID, "header_session_id", opts.HeaderSessionID),
+		clientStickyKey(opts.APIKeyID, "header_conversation_id", opts.HeaderConversationID),
+		clientStickyKey(opts.APIKeyID, "prompt_cache_key", stringFromAny(body["prompt_cache_key"])),
+		clientStickyKey(opts.APIKeyID, "metadata_session_id", stringFromMetadata(metadata, "session_id", "notion_session_id")),
+		clientStickyKey(opts.APIKeyID, "conversation_id", firstNonEmpty(stringFromAny(body["conversation_id"]), stringFromAny(body["conversation"]))),
+		clientStickyKey(opts.APIKeyID, "metadata_conversation_id", stringFromMetadata(metadata, "conversation_id", "notion_conversation_id")),
+		clientStickyKey(opts.APIKeyID, "user", stringFromAny(body["user"])),
+	})
+}
+
+func clientStickyKey(apiKeyID uint, source string, value string) stickySessionKey {
+	value = strings.TrimSpace(value)
+	source = strings.TrimSpace(source)
+	if value == "" || source == "" {
+		return stickySessionKey{}
+	}
+	return stickySessionKey{
+		Key:    fmt.Sprintf("client:k%d:%s:%s", apiKeyID, source, value),
+		Source: source,
+	}
+}
+
+func responseStickyKey(apiKeyID uint, responseID string) string {
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" {
+		return ""
+	}
+	return fmt.Sprintf("response:k%d:%s", apiKeyID, responseID)
+}
+
+func appendUniqueStickyKeys(groups ...[]stickySessionKey) []stickySessionKey {
+	seen := map[string]struct{}{}
+	keys := []stickySessionKey{}
+	for _, group := range groups {
+		for _, key := range group {
+			if key.Key == "" {
+				continue
+			}
+			if _, ok := seen[key.Key]; ok {
+				continue
+			}
+			seen[key.Key] = struct{}{}
+			keys = append(keys, key)
+		}
+	}
+	return keys
 }
 
 func (s *OpenAIService) runPromptWithHealth(ctx context.Context, account model.Account, req NotionPromptRequest) (model.Account, NotionRunResult, error) {
@@ -417,6 +636,9 @@ func structuredFileContentToText(item map[string]any) string {
 	}
 	if imageURL := mapFromAny(item["image_url"]); imageURL != nil {
 		if ref := firstNonEmpty(stringFromAny(imageURL["url"]), stringFromAny(imageURL["value"])); ref != "" {
+			if strings.HasPrefix(strings.TrimSpace(ref), "data:") {
+				return formatFileReferenceForPrompt(name, "inline image data")
+			}
 			return formatFileReferenceForPrompt(name, ref)
 		}
 	}
@@ -917,10 +1139,31 @@ func maybeBuildCodexFileToolCallResult(modelID string, body map[string]any) (Com
 	if body == nil || responsesInputHasToolOutput(body["input"]) || isCodexTitleGenerationRequest(body) {
 		return CompletionResult{}, false
 	}
-	files := codexFileRefsFromResponsesInput(body["input"])
+	files := codexFileRefsFromResponsesBody(body)
 	if len(files) == 0 {
 		return CompletionResult{}, false
 	}
+	return buildCodexFileToolCallResult(modelID, body, files, "codex_file_reference", nil)
+}
+
+func maybeBuildCodexAssistantTextToolCallResult(modelID string, body map[string]any, answer string, baseTrace map[string]any) (CompletionResult, bool) {
+	if body == nil || responsesInputHasToolOutput(body["input"]) || isCodexTitleGenerationRequest(body) {
+		return CompletionResult{}, false
+	}
+	if !codexAssistantTextLooksLikeFileToolCall(answer) {
+		return CompletionResult{}, false
+	}
+	files := codexFileRefsFromAssistantToolText(answer)
+	if len(files) == 0 {
+		files = codexFileRefsFromResponsesBody(body)
+	}
+	if len(files) == 0 {
+		return CompletionResult{}, false
+	}
+	return buildCodexFileToolCallResult(modelID, body, files, "assistant_text_tool_call", baseTrace)
+}
+
+func buildCodexFileToolCallResult(modelID string, body map[string]any, files []string, reason string, baseTrace map[string]any) (CompletionResult, bool) {
 	toolName, args, ok := codexFileReadToolCall(body["tools"], files)
 	if !ok {
 		return CompletionResult{}, false
@@ -929,7 +1172,12 @@ func maybeBuildCodexFileToolCallResult(modelID string, body map[string]any) (Com
 	if err != nil {
 		return CompletionResult{}, false
 	}
-	promptTokens := security.EstimateTokens(legacyPromptFromResponsesInput(body["input"]))
+	prompt, hiddenPrompt, hiddenMessages := responsesPromptPartsFromBody(body)
+	promptForUsage := joinHiddenPromptParts(prompt, hiddenPrompt)
+	if promptForUsage == "" {
+		promptForUsage = legacyPromptFromResponsesInput(body["input"])
+	}
+	promptTokens := security.EstimateTokens(promptForUsage)
 	completionTokens := security.EstimateTokens(string(encodedArgs))
 	usage := dto.UsageDTO{
 		PromptTokens:     promptTokens,
@@ -937,17 +1185,22 @@ func maybeBuildCodexFileToolCallResult(modelID string, body map[string]any) (Com
 		TotalTokens:      promptTokens + completionTokens,
 		Estimated:        true,
 	}
-	trace := map[string]any{
-		"converted_only": true,
-		"tool_call": map[string]any{
-			"name":      toolName,
-			"arguments": args,
-			"reason":    "codex_file_reference",
-		},
+	trace := map[string]any{}
+	for key, value := range baseTrace {
+		trace[key] = value
+	}
+	if reason == "codex_file_reference" {
+		trace["converted_only"] = true
+	} else {
+		trace["assistant_text_tool_call_converted"] = true
+	}
+	trace["tool_call"] = map[string]any{
+		"name":      toolName,
+		"arguments": args,
+		"reason":    reason,
 	}
 	responseID := newResponsesID("resp")
 	callID := newResponsesID("call")
-	prompt, hiddenPrompt, hiddenMessages := responsesPromptPartsFromBody(body)
 	storePendingResponseContext(pendingResponseContext{
 		ResponseID:     responseID,
 		CallID:         callID,
@@ -1007,6 +1260,16 @@ func codexReadFileCommand(file string) string {
 	return "sed -n '1,400p' " + shellQuote(file)
 }
 
+func codexFileRefsFromResponsesBody(body map[string]any) []string {
+	if body == nil {
+		return nil
+	}
+	return uniqueCodexFileRefs(
+		codexFileRefsFromResponsesInput(body["input"]),
+		codexFileRefsFromResponsesInput(body["attachments"]),
+	)
+}
+
 func shellQuote(value string) string {
 	if value == "" {
 		return "''"
@@ -1015,14 +1278,11 @@ func shellQuote(value string) string {
 }
 
 func codexFileRefsFromResponsesInput(input any) []string {
-	return codexFileRefsFromText(legacyPromptFromResponsesInput(input))
+	return codexFileRefsFromText(promptFromResponsesInput(input))
 }
 
 func codexFileRefsFromText(text string) []string {
 	matches := codexMarkdownFileLinkPattern.FindAllStringSubmatch(text, -1)
-	if len(matches) == 0 {
-		return nil
-	}
 	seen := map[string]struct{}{}
 	files := make([]string, 0, len(matches))
 	for _, match := range matches {
@@ -1030,6 +1290,121 @@ func codexFileRefsFromText(text string) []string {
 			continue
 		}
 		file := normalizeCodexFileRef(match[1], match[2])
+		if file == "" {
+			continue
+		}
+		if _, exists := seen[file]; exists {
+			continue
+		}
+		seen[file] = struct{}{}
+		files = append(files, file)
+		if len(files) >= 8 {
+			break
+		}
+	}
+	if len(files) < 8 && codexTextHasFileReadIntent(text) {
+		for _, match := range codexPlainFileRefPattern.FindAllStringSubmatch(text, -1) {
+			if len(match) < 2 {
+				continue
+			}
+			file := normalizeCodexFileRef(match[1], match[1])
+			if file == "" || !codexLooksLikePlainFileRef(file) {
+				continue
+			}
+			if _, exists := seen[file]; exists {
+				continue
+			}
+			seen[file] = struct{}{}
+			files = append(files, file)
+			if len(files) >= 8 {
+				break
+			}
+		}
+	}
+	return files
+}
+
+func codexAssistantTextLooksLikeFileToolCall(text string) bool {
+	lower := strings.ToLower(text)
+	return strings.Contains(lower, "connections.fs.readfiles") ||
+		strings.Contains(lower, "connections.fs.readfile") ||
+		strings.Contains(lower, `"exec_command"`) ||
+		strings.Contains(lower, `function":"exec_command`) ||
+		strings.Contains(lower, `function": "exec_command`)
+}
+
+func codexFileRefsFromAssistantToolText(text string) []string {
+	files := []string{}
+	for _, match := range codexQuotedFilesPattern.FindAllStringSubmatch(text, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		var parsed []string
+		if err := json.Unmarshal([]byte("["+match[1]+"]"), &parsed); err == nil {
+			for _, file := range parsed {
+				files = append(files, file)
+			}
+			continue
+		}
+		for _, quoted := range codexJSONStringPattern.FindAllStringSubmatch(match[1], -1) {
+			if len(quoted) < 2 {
+				continue
+			}
+			var decoded string
+			if err := json.Unmarshal([]byte(`"`+quoted[1]+`"`), &decoded); err == nil {
+				files = append(files, decoded)
+			}
+		}
+	}
+	for _, match := range codexQuotedFilePattern.FindAllStringSubmatch(text, -1) {
+		if len(match) >= 2 {
+			files = append(files, match[1])
+		}
+	}
+	return normalizeUniqueCodexFileRefs(files)
+}
+
+func codexTextHasFileReadIntent(text string) bool {
+	lower := strings.ToLower(text)
+	for _, marker := range []string{
+		"查看", "读取", "打开", "内容", "文件", "部署",
+		"read", "view", "open", "show", "inspect", "look at", "cat ",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func codexLooksLikePlainFileRef(file string) bool {
+	base := file
+	if idx := strings.LastIndex(base, "/"); idx >= 0 {
+		base = base[idx+1:]
+	}
+	switch strings.ToLower(base) {
+	case "dockerfile", "makefile", "compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml":
+		return true
+	}
+	if strings.HasPrefix(base, ".") {
+		return false
+	}
+	return strings.Contains(base, ".")
+}
+
+func uniqueCodexFileRefs(groups ...[]string) []string {
+	files := []string{}
+	for _, group := range groups {
+		files = append(files, group...)
+	}
+	return normalizeUniqueCodexFileRefs(files)
+}
+
+func normalizeUniqueCodexFileRefs(rawFiles []string) []string {
+	seen := map[string]struct{}{}
+	files := make([]string, 0, len(rawFiles))
+	for _, raw := range rawFiles {
+		file := normalizeCodexFileRef(raw, raw)
 		if file == "" {
 			continue
 		}

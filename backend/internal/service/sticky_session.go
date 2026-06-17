@@ -21,6 +21,7 @@ import (
 )
 
 type StickyThreadBinding struct {
+	StickyKey    string    `json:"sticky_key,omitempty"`
 	ThreadID     string    `json:"thread_id"`
 	AccountID    uint      `json:"account_id"`
 	AccountEmail string    `json:"account_email"`
@@ -156,11 +157,17 @@ func (s *memoryStickySessionStore) Get(_ context.Context, threadID string) (Stic
 		s.mu.Unlock()
 		return StickyThreadBinding{}, false, nil
 	}
+	if binding.StickyKey == "" {
+		binding.StickyKey = key
+	}
+	if binding.ThreadID == "" {
+		binding.ThreadID = key
+	}
 	return binding, true, nil
 }
 
 func (s *memoryStickySessionStore) Set(_ context.Context, binding StickyThreadBinding, ttl time.Duration) error {
-	key := stickyThreadKey(firstNonEmpty(binding.ThreadID))
+	key := stickyThreadKey(firstNonEmpty(binding.StickyKey, binding.ThreadID))
 	if key == "" || binding.AccountID == 0 {
 		return nil
 	}
@@ -171,7 +178,10 @@ func (s *memoryStickySessionStore) Set(_ context.Context, binding StickyThreadBi
 	if binding.CreatedAt.IsZero() {
 		binding.CreatedAt = now
 	}
-	binding.ThreadID = key
+	if binding.ThreadID == "" {
+		binding.ThreadID = key
+	}
+	binding.StickyKey = key
 	binding.UpdatedAt = now
 	binding.ExpiresAt = now.Add(ttl)
 	s.mu.Lock()
@@ -245,11 +255,17 @@ func (s *redisStickySessionStore) Get(ctx context.Context, threadID string) (Sti
 		_ = s.Delete(ctx, key)
 		return StickyThreadBinding{}, false, nil
 	}
+	if binding.StickyKey == "" {
+		binding.StickyKey = key
+	}
+	if binding.ThreadID == "" {
+		binding.ThreadID = key
+	}
 	return binding, true, nil
 }
 
 func (s *redisStickySessionStore) Set(ctx context.Context, binding StickyThreadBinding, ttl time.Duration) error {
-	key := stickyThreadKey(binding.ThreadID)
+	key := stickyThreadKey(firstNonEmpty(binding.StickyKey, binding.ThreadID))
 	if key == "" || binding.AccountID == 0 {
 		return nil
 	}
@@ -260,7 +276,10 @@ func (s *redisStickySessionStore) Set(ctx context.Context, binding StickyThreadB
 	if binding.CreatedAt.IsZero() {
 		binding.CreatedAt = now
 	}
-	binding.ThreadID = key
+	if binding.ThreadID == "" {
+		binding.ThreadID = key
+	}
+	binding.StickyKey = key
 	binding.UpdatedAt = now
 	binding.ExpiresAt = now.Add(ttl)
 	raw, err := json.Marshal(binding)

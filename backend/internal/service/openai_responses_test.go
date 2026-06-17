@@ -107,6 +107,38 @@ func TestPromptAndHiddenFromResponsesInputIncludesInlineFileData(t *testing.T) {
 	}
 }
 
+func TestResponsesAttachmentUploadsFromBodyExtractsInputImageData(t *testing.T) {
+	imageData := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString([]byte("jpeg-bytes"))
+	body := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Describe this image."},
+					map[string]any{"type": "input_image", "filename": "image.jpg", "image_url": map[string]any{"url": imageData}},
+				},
+			},
+		},
+	}
+
+	uploads := responsesAttachmentUploadsFromBody(body)
+	if len(uploads) != 1 {
+		t.Fatalf("expected one upload, got %#v", uploads)
+	}
+	upload := uploads[0]
+	if upload.Name != "image.jpg" || upload.ContentType != "image/jpeg" || string(upload.Data) != "jpeg-bytes" {
+		t.Fatalf("unexpected upload %#v", upload)
+	}
+	prompt := promptFromResponsesInput(body["input"])
+	if strings.Contains(prompt, imageData) {
+		t.Fatalf("prompt leaked image data URL: %q", prompt)
+	}
+	if !strings.Contains(prompt, "inline image data") {
+		t.Fatalf("expected prompt to retain an inline image reference, got %q", prompt)
+	}
+}
+
 func TestMaybeBuildCodexFileToolCallResultUsesExecCommand(t *testing.T) {
 	body := map[string]any{
 		"input": []any{
@@ -143,6 +175,82 @@ func TestMaybeBuildCodexFileToolCallResultUsesExecCommand(t *testing.T) {
 	}
 	if result.Payload["output_text"] != "" {
 		t.Fatalf("function call response should not include text output: %#v", result.Payload["output_text"])
+	}
+}
+
+func TestMaybeBuildCodexFileToolCallResultUsesPlainFilename(t *testing.T) {
+	body := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "帮我查看 Dockerfile 的内容"},
+				},
+			},
+		},
+		"tools": []any{
+			map[string]any{"type": "function", "name": "connections.fs.readFiles"},
+		},
+	}
+
+	result, ok := maybeBuildCodexFileToolCallResult("gpt-test", body)
+	if !ok {
+		t.Fatal("expected plain Dockerfile reference to produce a tool call")
+	}
+	output := result.Payload["output"].([]any)
+	item := output[0].(map[string]any)
+	defer pendingResponseContexts.Delete("resp:" + result.Payload["id"].(string))
+	defer pendingResponseContexts.Delete("call:" + item["call_id"].(string))
+	if item["type"] != "function_call" || item["name"] != "connections.fs.readFiles" {
+		t.Fatalf("unexpected function call item %#v", item)
+	}
+	var args map[string][]string
+	if err := json.Unmarshal([]byte(item["arguments"].(string)), &args); err != nil {
+		t.Fatalf("invalid arguments json: %v", err)
+	}
+	if len(args["files"]) != 1 || args["files"][0] != "Dockerfile" {
+		t.Fatalf("expected Dockerfile read args, got %#v", args)
+	}
+}
+
+func TestMaybeBuildCodexAssistantTextToolCallResultConvertsHallucinatedCall(t *testing.T) {
+	body := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "帮我查看 Dockerfile 的内容"},
+				},
+			},
+		},
+		"tools": []any{
+			map[string]any{"type": "function", "name": "connections.fs.readFiles"},
+		},
+	}
+	answer := `我function":"connections.fs.readFiles","args":{"files":["Dockerfile"]}}`
+
+	result, ok := maybeBuildCodexAssistantTextToolCallResult("gpt-test", body, answer, map[string]any{"thread_id": "thread-1"})
+	if !ok {
+		t.Fatal("expected assistant text function call to be converted")
+	}
+	output := result.Payload["output"].([]any)
+	item := output[0].(map[string]any)
+	defer pendingResponseContexts.Delete("resp:" + result.Payload["id"].(string))
+	defer pendingResponseContexts.Delete("call:" + item["call_id"].(string))
+	if item["type"] != "function_call" || item["name"] != "connections.fs.readFiles" {
+		t.Fatalf("unexpected function call item %#v", item)
+	}
+	var args map[string][]string
+	if err := json.Unmarshal([]byte(item["arguments"].(string)), &args); err != nil {
+		t.Fatalf("invalid arguments json: %v", err)
+	}
+	if len(args["files"]) != 1 || args["files"][0] != "Dockerfile" {
+		t.Fatalf("expected Dockerfile read args, got %#v", args)
+	}
+	if result.Payload["output_text"] != "" {
+		t.Fatalf("function call response should not include assistant text: %#v", result.Payload["output_text"])
 	}
 }
 
