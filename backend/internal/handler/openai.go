@@ -145,25 +145,238 @@ func (h *Handler) streamResponse(c *gin.Context, result service.CompletionResult
 	c.Header("Connection", "keep-alive")
 	c.Status(http.StatusOK)
 
-	outputItemID := "msg-" + fmt.Sprint(result.Payload["id"])
-
-	if len(result.Text) > 0 {
-		delta, _ := json.Marshal(map[string]any{
-			"type":     "response.output_text.delta",
-			"item_id":  outputItemID,
-			"output_index": 0,
-			"content_index": 0,
-			"delta":    result.Text,
-		})
-		writeSSE(c.Writer, "response.output_text.delta", delta)
+	outputItems := responseOutputItems(result.Payload["output"])
+	if len(outputItems) > 0 && responseStringField(outputItems[0], "type") == "function_call" {
+		h.streamResponseFunctionCall(c, result, outputItems[0])
+		return
 	}
 
-	completed, _ := json.Marshal(map[string]any{
-		"type":     "response.completed",
+	responseID := responseStringField(result.Payload, "id")
+	outputItemID := responseOutputItemID(result.Payload)
+	if outputItemID == "" {
+		outputItemID = "msg_" + strings.TrimPrefix(strings.ReplaceAll(responseID, "-", ""), "resp_")
+	}
+	inProgressResponse := responseObjectForStream(result.Payload, "in_progress")
+	inProgressItem := responseMessageItem(outputItemID, "", "in_progress")
+	completedItem := responseMessageItem(outputItemID, result.Text, "completed")
+
+	sequenceNumber := 0
+	writeEvent := func(event string, payload map[string]any) {
+		if payload == nil {
+			payload = map[string]any{}
+		}
+		payload["type"] = event
+		payload["sequence_number"] = sequenceNumber
+		sequenceNumber++
+		encoded, _ := json.Marshal(payload)
+		writeSSE(c.Writer, event, encoded)
+	}
+
+	writeEvent("response.created", map[string]any{"response": inProgressResponse})
+	writeEvent("response.in_progress", map[string]any{"response": inProgressResponse})
+	writeEvent("response.output_item.added", map[string]any{
+		"response_id":  responseID,
+		"output_index": 0,
+		"item":         inProgressItem,
+	})
+	writeEvent("response.content_part.added", map[string]any{
+		"response_id":   responseID,
+		"output_index":  0,
+		"item_id":       outputItemID,
+		"content_index": 0,
+		"part":          responseOutputTextPart(""),
+	})
+	for _, part := range splitResponseTextChunks(result.Text, 64) {
+		if part == "" {
+			continue
+		}
+		writeEvent("response.output_text.delta", map[string]any{
+			"response_id":   responseID,
+			"output_index":  0,
+			"item_id":       outputItemID,
+			"content_index": 0,
+			"delta":         part,
+		})
+	}
+	writeEvent("response.output_text.done", map[string]any{
+		"response_id":   responseID,
+		"output_index":  0,
+		"item_id":       outputItemID,
+		"content_index": 0,
+		"text":          result.Text,
+	})
+	writeEvent("response.content_part.done", map[string]any{
+		"response_id":   responseID,
+		"output_index":  0,
+		"item_id":       outputItemID,
+		"content_index": 0,
+		"part":          responseOutputTextPart(result.Text),
+	})
+	writeEvent("response.output_item.done", map[string]any{
+		"response_id":  responseID,
+		"output_index": 0,
+		"item":         completedItem,
+	})
+	writeEvent("response.completed", map[string]any{
 		"response": result.Payload,
 	})
-	writeSSE(c.Writer, "response.completed", completed)
 	writeSSEDone(c.Writer)
+}
+
+func (h *Handler) streamResponseFunctionCall(c *gin.Context, result service.CompletionResult, item map[string]any) {
+	responseID := responseStringField(result.Payload, "id")
+	outputItemID := responseStringField(item, "id")
+	if outputItemID == "" {
+		outputItemID = "fc_" + strings.TrimPrefix(strings.ReplaceAll(responseID, "-", ""), "resp_")
+	}
+	arguments := responseStringField(item, "arguments")
+	inProgressResponse := responseObjectForStream(result.Payload, "in_progress")
+	inProgressItem := cloneResponseMap(item)
+	inProgressItem["id"] = outputItemID
+	inProgressItem["status"] = "in_progress"
+	inProgressItem["arguments"] = ""
+	completedItem := cloneResponseMap(item)
+	completedItem["id"] = outputItemID
+	completedItem["status"] = "completed"
+
+	sequenceNumber := 0
+	writeEvent := func(event string, payload map[string]any) {
+		if payload == nil {
+			payload = map[string]any{}
+		}
+		payload["type"] = event
+		payload["sequence_number"] = sequenceNumber
+		sequenceNumber++
+		encoded, _ := json.Marshal(payload)
+		writeSSE(c.Writer, event, encoded)
+	}
+
+	writeEvent("response.created", map[string]any{"response": inProgressResponse})
+	writeEvent("response.in_progress", map[string]any{"response": inProgressResponse})
+	writeEvent("response.output_item.added", map[string]any{
+		"response_id":  responseID,
+		"output_index": 0,
+		"item":         inProgressItem,
+	})
+	if arguments != "" {
+		writeEvent("response.function_call_arguments.delta", map[string]any{
+			"response_id":  responseID,
+			"output_index": 0,
+			"item_id":      outputItemID,
+			"delta":        arguments,
+		})
+	}
+	writeEvent("response.function_call_arguments.done", map[string]any{
+		"response_id":  responseID,
+		"output_index": 0,
+		"item_id":      outputItemID,
+		"arguments":    arguments,
+	})
+	writeEvent("response.output_item.done", map[string]any{
+		"response_id":  responseID,
+		"output_index": 0,
+		"item":         completedItem,
+	})
+	writeEvent("response.completed", map[string]any{
+		"response": result.Payload,
+	})
+	writeSSEDone(c.Writer)
+}
+
+func responseObjectForStream(payload map[string]any, status string) map[string]any {
+	out := cloneResponseMap(payload)
+	out["status"] = status
+	out["completed_at"] = nil
+	out["output"] = []any{}
+	out["output_text"] = ""
+	out["usage"] = nil
+	return out
+}
+
+func cloneResponseMap(payload map[string]any) map[string]any {
+	out := make(map[string]any, len(payload))
+	for key, value := range payload {
+		out[key] = value
+	}
+	return out
+}
+
+func responseOutputItemID(payload map[string]any) string {
+	for _, rawItem := range responseOutputItems(payload["output"]) {
+		if id := responseStringField(rawItem, "id"); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+func responseOutputItems(value any) []map[string]any {
+	switch typed := value.(type) {
+	case []any:
+		out := make([]map[string]any, 0, len(typed))
+		for _, item := range typed {
+			if mapped, ok := item.(map[string]any); ok {
+				out = append(out, mapped)
+			}
+		}
+		return out
+	case []map[string]any:
+		return typed
+	default:
+		return nil
+	}
+}
+
+func responseMessageItem(itemID string, text string, status string) map[string]any {
+	if strings.TrimSpace(status) == "" {
+		status = "completed"
+	}
+	return map[string]any{
+		"id":     itemID,
+		"type":   "message",
+		"status": status,
+		"role":   "assistant",
+		"content": []any{
+			responseOutputTextPart(text),
+		},
+	}
+}
+
+func responseOutputTextPart(text string) map[string]any {
+	return map[string]any{
+		"type":        "output_text",
+		"text":        text,
+		"annotations": []any{},
+	}
+}
+
+func responseStringField(item map[string]any, key string) string {
+	if item == nil {
+		return ""
+	}
+	if value, ok := item[key].(string); ok {
+		return strings.TrimSpace(value)
+	}
+	return ""
+}
+
+func splitResponseTextChunks(text string, chunkRunes int) []string {
+	if chunkRunes <= 0 {
+		chunkRunes = 64
+	}
+	runes := []rune(text)
+	if len(runes) == 0 {
+		return []string{""}
+	}
+	chunks := make([]string, 0, len(runes)/chunkRunes+1)
+	for start := 0; start < len(runes); start += chunkRunes {
+		end := start + chunkRunes
+		if end > len(runes) {
+			end = len(runes)
+		}
+		chunks = append(chunks, string(runes[start:end]))
+	}
+	return chunks
 }
 
 func writeSSE(w http.ResponseWriter, event string, payload []byte) {
