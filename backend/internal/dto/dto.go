@@ -106,6 +106,23 @@ type UsageDTO struct {
 	Estimated        bool  `json:"estimated"`
 }
 
+type APIKeyUsageDTO struct {
+	ID               uint      `json:"id"`
+	APIKeyID         uint      `json:"api_key_id"`
+	APIKeyName       string    `json:"api_key_name,omitempty"`
+	APIKey           string    `json:"api_key"`
+	APIKeyMasked     string    `json:"api_key_masked,omitempty"`
+	Date             string    `json:"date"`
+	Model            string    `json:"model"`
+	RequestCount     int64     `json:"request_count"`
+	PromptTokens     int64     `json:"prompt_tokens"`
+	CompletionTokens int64     `json:"completion_tokens"`
+	TotalTokens      int64     `json:"total_tokens"`
+	EstimatedTokens  int64     `json:"estimated_tokens"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
 type RequestLogDTO struct {
 	ID               uint       `json:"id"`
 	APIKeyID         *uint      `json:"api_key_id,omitempty"`

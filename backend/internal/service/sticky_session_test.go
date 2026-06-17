@@ -81,6 +81,30 @@ func TestMemoryStickySessionStoreAliasPreservesThreadID(t *testing.T) {
 	}
 }
 
+func TestOpenAIServiceClearStickyThreadBindingsDeletesThreadAndAliases(t *testing.T) {
+	sticky := newMemoryStickySessionStore(time.Minute)
+	ctx := context.Background()
+	alias := clientStickyKey(7, "prompt_cache_key", "cache-1")
+	for _, binding := range []StickyThreadBinding{
+		{ThreadID: "notion-thread-1", AccountID: 42},
+		{StickyKey: alias.Key, ThreadID: "notion-thread-1", AccountID: 42},
+	} {
+		if err := sticky.Set(ctx, binding, time.Minute); err != nil {
+			t.Fatalf("set sticky binding: %v", err)
+		}
+	}
+
+	svc := &OpenAIService{sticky: sticky}
+	svc.clearStickyThreadBindings(ctx, "notion-thread-1", []stickySessionKey{alias})
+
+	if _, ok, err := sticky.Get(ctx, "notion-thread-1"); err != nil || ok {
+		t.Fatalf("expected thread binding to be cleared, ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := sticky.Get(ctx, alias.Key); err != nil || ok {
+		t.Fatalf("expected alias binding to be cleared, ok=%v err=%v", ok, err)
+	}
+}
+
 func TestOpenAIServiceSelectAccountForClientSessionBinding(t *testing.T) {
 	ctx := context.Background()
 	cfg := config.Default()

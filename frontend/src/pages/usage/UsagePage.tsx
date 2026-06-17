@@ -1,4 +1,4 @@
-import { Table, Tag, App as AntApp } from 'antd';
+import { Table, Tag, Typography, App as AntApp } from 'antd';
 import { useEffect, useState } from 'react';
 import { adminApi } from '../../services/adminApi';
 import type { UsageRow } from '../../types/api';
@@ -21,9 +21,21 @@ export function UsagePage() {
       <Table
         rowKey="id"
         dataSource={rows}
+        scroll={{ x: 1200 }}
         columns={[
           { title: '日期', dataIndex: 'date' },
-          { title: 'API 密钥 ID', dataIndex: 'api_key_id' },
+          { title: 'API 密钥名称', dataIndex: 'api_key_name', render: (value: string) => value || '-' },
+          {
+            title: 'apiKey',
+            dataIndex: 'api_key',
+            render: (value: string, row) => value ? (
+              <Typography.Text code copyable={{ text: value }} ellipsis style={{ maxWidth: 360 }}>
+                {value}
+              </Typography.Text>
+            ) : (
+              <Typography.Text type="secondary">{row.api_key_masked || '-'}</Typography.Text>
+            )
+          },
           { title: '模型', dataIndex: 'model' },
           { title: '请求数', dataIndex: 'request_count' },
           { title: 'Prompt', dataIndex: 'prompt_tokens' },

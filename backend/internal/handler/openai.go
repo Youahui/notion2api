@@ -165,8 +165,8 @@ func (h *Handler) streamResponse(c *gin.Context, result service.CompletionResult
 
 	requestID := c.GetString("request_id")
 	outputItems := responseOutputItems(result.Payload["output"])
-	if len(outputItems) > 0 && responseStringField(outputItems[0], "type") == "function_call" {
-		h.streamResponseFunctionCall(c, result, outputItems[0])
+	if responseOutputItemsAreToolCalls(outputItems) {
+		h.streamResponseToolCalls(c, result, outputItems)
 		return
 	}
 
@@ -238,7 +238,7 @@ func (h *Handler) streamResponse(c *gin.Context, result service.CompletionResult
 		"output_index": 0,
 		"item":         completedItem,
 	})
-	writeEvent("response.completed", map[string]any{
+	writeEvent(responseFinalStreamEvent(result.Payload), map[string]any{
 		"response": result.Payload,
 	})
 	slog.Info("responses sse send done",
@@ -249,22 +249,10 @@ func (h *Handler) streamResponse(c *gin.Context, result service.CompletionResult
 	writeSSEDone(c.Writer)
 }
 
-func (h *Handler) streamResponseFunctionCall(c *gin.Context, result service.CompletionResult, item map[string]any) {
+func (h *Handler) streamResponseToolCalls(c *gin.Context, result service.CompletionResult, items []map[string]any) {
 	requestID := c.GetString("request_id")
 	responseID := responseStringField(result.Payload, "id")
-	outputItemID := responseStringField(item, "id")
-	if outputItemID == "" {
-		outputItemID = "fc_" + strings.TrimPrefix(strings.ReplaceAll(responseID, "-", ""), "resp_")
-	}
-	arguments := responseStringField(item, "arguments")
 	inProgressResponse := responseObjectForStream(result.Payload, "in_progress")
-	inProgressItem := cloneResponseMap(item)
-	inProgressItem["id"] = outputItemID
-	inProgressItem["status"] = "in_progress"
-	inProgressItem["arguments"] = ""
-	completedItem := cloneResponseMap(item)
-	completedItem["id"] = outputItemID
-	completedItem["status"] = "completed"
 
 	sequenceNumber := 0
 	writeEvent := func(event string, payload map[string]any) {
@@ -282,31 +270,72 @@ func (h *Handler) streamResponseFunctionCall(c *gin.Context, result service.Comp
 
 	writeEvent("response.created", map[string]any{"response": inProgressResponse})
 	writeEvent("response.in_progress", map[string]any{"response": inProgressResponse})
-	writeEvent("response.output_item.added", map[string]any{
-		"response_id":  responseID,
-		"output_index": 0,
-		"item":         inProgressItem,
-	})
-	if arguments != "" {
-		writeEvent("response.function_call_arguments.delta", map[string]any{
+	for index, item := range items {
+		itemType := responseStringField(item, "type")
+		outputItemID := responseStringField(item, "id")
+		if outputItemID == "" {
+			prefix := "fc_"
+			if itemType == "custom_tool_call" {
+				prefix = "ctc_"
+			}
+			outputItemID = prefix + strings.TrimPrefix(strings.ReplaceAll(responseID, "-", ""), "resp_")
+			if len(items) > 1 {
+				outputItemID = fmt.Sprintf("%s%d_%s", prefix, index, strings.TrimPrefix(strings.ReplaceAll(responseID, "-", ""), "resp_"))
+			}
+		}
+		inProgressItem := cloneResponseMap(item)
+		inProgressItem["id"] = outputItemID
+		inProgressItem["status"] = "in_progress"
+		completedItem := cloneResponseMap(item)
+		completedItem["id"] = outputItemID
+		completedItem["status"] = "completed"
+
+		writeEvent("response.output_item.added", map[string]any{
 			"response_id":  responseID,
-			"output_index": 0,
-			"item_id":      outputItemID,
-			"delta":        arguments,
+			"output_index": index,
+			"item":         toolCallStreamStartItem(inProgressItem),
+		})
+		switch itemType {
+		case "function_call":
+			arguments := responseStringField(item, "arguments")
+			if arguments != "" {
+				writeEvent("response.function_call_arguments.delta", map[string]any{
+					"response_id":  responseID,
+					"output_index": index,
+					"item_id":      outputItemID,
+					"delta":        arguments,
+				})
+			}
+			writeEvent("response.function_call_arguments.done", map[string]any{
+				"response_id":  responseID,
+				"output_index": index,
+				"item_id":      outputItemID,
+				"arguments":    arguments,
+			})
+		case "custom_tool_call":
+			input := responseStringField(item, "input")
+			if input != "" {
+				writeEvent("response.custom_tool_call_input.delta", map[string]any{
+					"response_id":  responseID,
+					"output_index": index,
+					"item_id":      outputItemID,
+					"delta":        input,
+				})
+			}
+			writeEvent("response.custom_tool_call_input.done", map[string]any{
+				"response_id":  responseID,
+				"output_index": index,
+				"item_id":      outputItemID,
+				"input":        input,
+			})
+		}
+		writeEvent("response.output_item.done", map[string]any{
+			"response_id":  responseID,
+			"output_index": index,
+			"item":         completedItem,
 		})
 	}
-	writeEvent("response.function_call_arguments.done", map[string]any{
-		"response_id":  responseID,
-		"output_index": 0,
-		"item_id":      outputItemID,
-		"arguments":    arguments,
-	})
-	writeEvent("response.output_item.done", map[string]any{
-		"response_id":  responseID,
-		"output_index": 0,
-		"item":         completedItem,
-	})
-	writeEvent("response.completed", map[string]any{
+	writeEvent(responseFinalStreamEvent(result.Payload), map[string]any{
 		"response": result.Payload,
 	})
 	slog.Info("responses sse send done",
@@ -315,6 +344,17 @@ func (h *Handler) streamResponseFunctionCall(c *gin.Context, result service.Comp
 		"events", sequenceNumber,
 	)
 	writeSSEDone(c.Writer)
+}
+
+func toolCallStreamStartItem(item map[string]any) map[string]any {
+	out := cloneResponseMap(item)
+	switch responseStringField(out, "type") {
+	case "function_call":
+		out["arguments"] = ""
+	case "custom_tool_call":
+		out["input"] = ""
+	}
+	return out
 }
 
 func responseObjectForStream(payload map[string]any, status string) map[string]any {
@@ -359,6 +399,27 @@ func responseOutputItems(value any) []map[string]any {
 	default:
 		return nil
 	}
+}
+
+func responseOutputItemsAreToolCalls(items []map[string]any) bool {
+	if len(items) == 0 {
+		return false
+	}
+	for _, item := range items {
+		switch responseStringField(item, "type") {
+		case "function_call", "custom_tool_call":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func responseFinalStreamEvent(payload map[string]any) string {
+	if strings.EqualFold(responseStringField(payload, "status"), "incomplete") {
+		return "response.incomplete"
+	}
+	return "response.completed"
 }
 
 func responseMessageItem(itemID string, text string, status string) map[string]any {
@@ -442,6 +503,7 @@ func summarizeResponsesSSEPayload(payload map[string]any) map[string]any {
 	addTextSummary(summary, "delta", responseSSEString(payload["delta"]))
 	addTextSummary(summary, "text", responseSSEString(payload["text"]))
 	addTextSummary(summary, "arguments", responseSSEString(payload["arguments"]))
+	addTextSummary(summary, "input", responseSSEString(payload["input"]))
 	if part := responseSSEMap(payload["part"]); part != nil {
 		summary["part_type"] = responseSSEString(part["type"])
 		addTextSummary(summary, "part_text", responseSSEString(part["text"]))
@@ -463,6 +525,7 @@ func summarizeResponsesSSEItem(item map[string]any) map[string]any {
 		}
 	}
 	addTextSummary(summary, "arguments", responseSSEString(item["arguments"]))
+	addTextSummary(summary, "input", responseSSEString(item["input"]))
 	if content := responseSSESlice(item["content"]); len(content) > 0 {
 		if part := responseSSEMap(content[0]); part != nil {
 			summary["content_part_type"] = responseSSEString(part["type"])

@@ -60,3 +60,58 @@ func TestLogsHydratesAPIKeyDisplayFields(t *testing.T) {
 		t.Fatalf("api_key_masked = %q, want %q", got.APIKeyMasked, wantMasked)
 	}
 }
+
+func TestUsageHydratesAPIKeyDisplayFields(t *testing.T) {
+	ctx := context.Background()
+	store, err := repository.OpenDatabase(config.DatabaseConfig{
+		Driver: "sqlite",
+		DSN:    filepath.Join(t.TempDir(), "test.sqlite"),
+	})
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	if err := store.AutoMigrate(); err != nil {
+		t.Fatalf("auto migrate: %v", err)
+	}
+
+	service := NewAPIKeyService(store, "test")
+	created, err := service.Create(ctx, 1, dto.CreateAPIKeyRequest{Name: "Usage Key"})
+	if err != nil {
+		t.Fatalf("create api key: %v", err)
+	}
+	if err := service.RecordUsage(ctx, UsageRecord{
+		APIKeyID:         created.ID,
+		Method:           "POST",
+		Route:            "/v1/chat/completions",
+		StatusCode:       200,
+		Model:            "gpt-5.5",
+		PromptTokens:     10,
+		CompletionTokens: 15,
+		TotalTokens:      25,
+		Estimated:        true,
+	}); err != nil {
+		t.Fatalf("record usage: %v", err)
+	}
+
+	rows, err := service.Usage(ctx, repository.UsageFilter{Limit: 100})
+	if err != nil {
+		t.Fatalf("list usage: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("usage length = %d, want 1", len(rows))
+	}
+	got := rows[0]
+	if got.APIKeyID != created.ID {
+		t.Fatalf("api_key_id = %d, want %d", got.APIKeyID, created.ID)
+	}
+	if got.APIKeyName != "Usage Key" {
+		t.Fatalf("api_key_name = %q, want Usage Key", got.APIKeyName)
+	}
+	if got.APIKey != created.APIKey {
+		t.Fatalf("api_key = %q, want %q", got.APIKey, created.APIKey)
+	}
+	wantMasked := created.KeyPrefix + "..." + created.KeySuffix
+	if got.APIKeyMasked != wantMasked {
+		t.Fatalf("api_key_masked = %q, want %q", got.APIKeyMasked, wantMasked)
+	}
+}

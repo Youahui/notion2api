@@ -71,13 +71,28 @@ type pendingResponseContext struct {
 	CreatedAt      time.Time
 }
 
+type responseFunctionToolCall struct {
+	Name      string
+	Arguments string
+	CallID    string
+	ItemID    string
+}
+
 var (
-	codexMarkdownFileLinkPattern = regexp.MustCompile(`\[([^\]\n]{1,512})\]\(([^)\s]+)\)`)
-	codexPlainFileRefPattern     = regexp.MustCompile(`(?:^|[\s"'` + "`" + `([{<，。！？、：；,;:!?])([A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)*|Dockerfile|Makefile|compose\.ya?ml|docker-compose\.ya?ml)(?:$|[\s"'` + "`" + `)\]}>，。！？、：；,;:!?])`)
-	codexQuotedFilesPattern      = regexp.MustCompile(`(?i)"files"\s*:\s*\[([^\]]*)\]`)
-	codexQuotedFilePattern       = regexp.MustCompile(`(?i)"file"\s*:\s*"([^"]{1,512})"`)
-	codexJSONStringPattern       = regexp.MustCompile(`"([^"\\]*(?:\\.[^"\\]*)*)"`)
-	pendingResponseContexts      sync.Map
+	codexMarkdownFileLinkPattern   = regexp.MustCompile(`\[([^\]\n]{1,512})\]\(([^)\s]+)\)`)
+	codexPlainFileRefPattern       = regexp.MustCompile(`(?:^|[\s"'` + "`" + `([{<，。！？、：；,;:!?])([A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)*|Dockerfile|Makefile|compose\.ya?ml|docker-compose\.ya?ml)(?:$|[\s"'` + "`" + `)\]}>，。！？、：；,;:!?])`)
+	codexQuotedFilesPattern        = regexp.MustCompile(`(?i)"files"\s*:\s*\[([^\]]*)\]`)
+	codexQuotedFilePattern         = regexp.MustCompile(`(?i)"file"\s*:\s*"([^"]{1,512})"`)
+	codexJSONStringPattern         = regexp.MustCompile(`"([^"\\]*(?:\\.[^"\\]*)*)"`)
+	codexBacktickContentPattern    = regexp.MustCompile("`([^`\\n]{1,512})`")
+	codexFencedCodePattern         = regexp.MustCompile("(?s)```(?:[A-Za-z0-9_-]+)?\\s*\\n(.*?)\\n```")
+	codexFencedCodeBlockPattern    = regexp.MustCompile("(?s)```([A-Za-z0-9_-]*)\\s*\\n(.*?)\\n```")
+	codexToolResultBlockPattern    = regexp.MustCompile(`(?s)<tool_result\b[^>]*>.*?</tool_result>\s*`)
+	codexContextResultBlockPattern = regexp.MustCompile(`(?s)<context_result\b[^>]*>.*?</context_result>\s*`)
+	responsesEnvContextPattern     = regexp.MustCompile(`(?s)<environment_context>.*?</environment_context>\s*`)
+	responsesToolCallPattern       = regexp.MustCompile(`(?s)<tool_call\b[^>]*>.*?</tool_call>\s*`)
+	responsesToolResultOpenTag     = regexp.MustCompile(`<tool_result\b[^>]*>`)
+	pendingResponseContexts        sync.Map
 )
 
 const pendingResponseContextTTL = 30 * time.Minute
@@ -123,7 +138,7 @@ func (s *OpenAIService) ChatCompletion(ctx context.Context, req dto.ChatCompleti
 	}
 	account := selection.Account
 	prompt, hiddenPrompt, hiddenMessages := normalizeChatMessages(req.Messages)
-	hiddenPrompt = appendResponseFormatInstruction(hiddenPrompt, req.ResponseFormat)
+	hiddenPrompt, hiddenMessages = appendResponseFormatInstruction(hiddenPrompt, hiddenMessages, req.ResponseFormat)
 	notionPrompt := prependHiddenPromptInstructionEnvelope(prompt, hiddenPrompt)
 	useWebSearch := s.cfg.Features.WebSearch
 	if req.UseWebSearch != nil {
@@ -146,6 +161,9 @@ func (s *OpenAIService) ChatCompletion(ctx context.Context, req dto.ChatCompleti
 	}
 	account, notionResult, err := s.runPromptWithHealth(ctx, account, notionReq)
 	if err != nil {
+		if isTrustRuleDeniedInferenceError(err) {
+			s.clearStickyThreadBindings(ctx, selection.ThreadID, sessionKeys)
+		}
 		s.accounts.MarkFailure(ctx, account.ID, err.Error())
 		return CompletionResult{}, err
 	}
@@ -207,6 +225,19 @@ func (s *OpenAIService) Response(ctx context.Context, body map[string]any, opts 
 		logCodexToolCallConversion(options, result)
 		return result, nil
 	}
+	if result, ok := maybeBuildCodexDeterministicEditToolCallResult(row.PublicID, body); ok {
+		logCodexToolCallConversion(options, result)
+		return result, nil
+	}
+	if result, ok := maybeBuildCodexApplyPatchCompletionResult(row.PublicID, body); ok {
+		slog.Info("responses completed local apply_patch output",
+			"request_id", options.RequestID,
+			"model", result.Model,
+			"response_id", stringFromAny(result.Payload["id"]),
+			"answer_preview", truncateRunes(collapseWhitespace(result.Text), 180),
+		)
+		return result, nil
+	}
 	sessionKeys := responseStickySessionKeys(body, options)
 	selection, err := s.selectAccountForStickyKeys(ctx, requestedAccountEmailFromMap(body), threadID, sessionKeys)
 	if err != nil {
@@ -214,7 +245,7 @@ func (s *OpenAIService) Response(ctx context.Context, body map[string]any, opts 
 	}
 	account := selection.Account
 	prompt, hiddenPrompt, hiddenMessages := responsesPromptPartsFromBody(body)
-	notionPrompt := prependHiddenPromptInstructionEnvelope(prompt, hiddenPrompt)
+	notionPrompt := responsesNotionVisiblePrompt(prompt, hiddenMessages)
 	useWebSearch := s.cfg.Features.WebSearch
 	if value, ok := boolFromAny(body["use_web_search"]); ok {
 		useWebSearch = value
@@ -223,8 +254,8 @@ func (s *OpenAIService) Response(ctx context.Context, body map[string]any, opts 
 	}
 	notionReq := NotionPromptRequest{
 		Prompt:           notionPrompt,
-		HiddenPrompt:     hiddenPrompt,
-		HiddenMessages:   hiddenMessages,
+		HiddenPrompt:     "",
+		HiddenMessages:   nil,
 		Attachments:      responsesAttachmentUploadsFromBody(body),
 		RequestID:        options.RequestID,
 		PublicModel:      row.PublicID,
@@ -236,6 +267,9 @@ func (s *OpenAIService) Response(ctx context.Context, body map[string]any, opts 
 	}
 	account, notionResult, err := s.runPromptWithHealth(ctx, account, notionReq)
 	if err != nil {
+		if isTrustRuleDeniedInferenceError(err) {
+			s.clearStickyThreadBindings(ctx, selection.ThreadID, sessionKeys)
+		}
 		s.accounts.MarkFailure(ctx, account.ID, err.Error())
 		return CompletionResult{}, err
 	}
@@ -269,14 +303,29 @@ func (s *OpenAIService) Response(ctx context.Context, body map[string]any, opts 
 		"request":        notionResult.Payload,
 	}
 	if toolResult, ok := maybeBuildCodexAssistantTextToolCallResult(row.PublicID, body, answer, trace); ok {
-		if responseID := stringFromAny(toolResult.Payload["id"]); responseID != "" {
-			s.bindStickyThread(ctx, account, notionResult, sessionKeys, responseID, options.APIKeyID)
+		if responseStoreEnabled(body) {
+			if responseID := stringFromAny(toolResult.Payload["id"]); responseID != "" {
+				s.bindStickyThread(ctx, account, notionResult, sessionKeys, responseID, options.APIKeyID)
+			}
 		}
 		logCodexToolCallConversion(options, toolResult)
 		return toolResult, nil
 	}
-	s.bindStickyThread(ctx, account, notionResult, sessionKeys, responseID, options.APIKeyID)
+	answer, incompleteDetails := applyResponsesOutputLimit(answer, body)
+	if incompleteDetails != nil {
+		completionTokens = security.EstimateTokens(answer)
+		usage.CompletionTokens = completionTokens
+		usage.TotalTokens = usage.PromptTokens + completionTokens
+	}
+	if responseStoreEnabled(body) {
+		s.bindStickyThread(ctx, account, notionResult, sessionKeys, responseID, options.APIKeyID)
+	}
 	payload := buildResponsesPayload(row.PublicID, answer, usage, responseID, newResponsesID("msg"), createdAt, body, trace)
+	if incompleteDetails != nil {
+		payload["status"] = "incomplete"
+		payload["incomplete_details"] = incompleteDetails
+		payload["completed_at"] = nil
+	}
 	return CompletionResult{Payload: payload, Usage: usage, Model: row.PublicID, Text: answer, Trace: payload["notion_trace"].(map[string]any)}, nil
 }
 
@@ -409,6 +458,27 @@ func (s *OpenAIService) bindStickyThread(ctx context.Context, account model.Acco
 	}
 }
 
+func (s *OpenAIService) clearStickyThreadBindings(ctx context.Context, threadID string, sessionKeys []stickySessionKey) {
+	if s.sticky == nil {
+		return
+	}
+	keys := []stickySessionKey{}
+	if cleanThreadID := strings.TrimSpace(threadID); cleanThreadID != "" {
+		keys = append(keys, stickySessionKey{Key: cleanThreadID, Source: "thread_id"})
+	}
+	keys = appendUniqueStickyKeys(keys, sessionKeys)
+	for _, key := range keys {
+		if key.Key == "" {
+			continue
+		}
+		if err := s.sticky.Delete(ctx, key.Key); err != nil {
+			slog.Warn("sticky session clear failed", "sticky_source", key.Source, "error", err)
+			continue
+		}
+		slog.Info("sticky session cleared after notion trust-rule denial", "sticky_source", key.Source)
+	}
+}
+
 func stickySource(hit bool, source string) string {
 	if !hit {
 		return ""
@@ -435,6 +505,8 @@ func logCodexToolCallConversion(opts OpenAIRequestOptions, result CompletionResu
 		"tool_name", stringFromAny(toolCall["name"]),
 		"reason", stringFromAny(toolCall["reason"]),
 		"arguments", toolCall["arguments"],
+		"input_preview", stringFromAny(toolCall["input_preview"]),
+		"tool_calls", result.Trace["tool_calls"],
 	)
 }
 
@@ -741,13 +813,119 @@ func responsesPromptPartsFromBody(body map[string]any) (string, string, []hidden
 			hiddenMessages = append(append([]hiddenPromptMessage{}, pending.HiddenMessages...), hiddenMessages...)
 		}
 	}
-	hiddenPrompt = appendResponseFormatInstruction(hiddenPrompt, body["response_format"])
+	prompt = normalizeRolePrefixesInPrompt(prompt)
+	prompt = applyResponsesInputTruncation(prompt, body)
+	hiddenPrompt = appendResponsesRequestControlInstructions(hiddenPrompt, body)
+	hiddenPrompt, hiddenMessages = appendResponseFormatInstruction(hiddenPrompt, hiddenMessages, body["response_format"])
 	return prompt, hiddenPrompt, hiddenMessages
 }
 
 func promptFromResponsesInput(input any) string {
 	prompt, _, _ := promptAndHiddenFromResponsesInput(input)
 	return prompt
+}
+
+func responsesNotionVisiblePrompt(prompt string, hiddenMessageGroups ...[]hiddenPromptMessage) string {
+	prompt = strings.TrimSpace(prompt)
+	if len(hiddenMessageGroups) > 0 {
+		prompt = joinPromptParts(responsesVisibleInstructionSections(hiddenMessageGroups[0]), prompt)
+	}
+	if prompt == "" {
+		return ""
+	}
+	prompt = normalizeRolePrefixesInPrompt(prompt)
+	prompt = responsesEnvContextPattern.ReplaceAllString(prompt, "")
+	prompt = responsesToolCallPattern.ReplaceAllString(prompt, "")
+	prompt = responsesToolResultOpenTag.ReplaceAllString(prompt, "<context_result>")
+	prompt = strings.ReplaceAll(prompt, "</tool_result>", "</context_result>")
+	prompt = strings.ReplaceAll(prompt, "<tool_result>", "<context_result>")
+	return strings.TrimSpace(prompt)
+}
+
+func responsesVisibleInstructionSections(messages []hiddenPromptMessage) string {
+	parts := []string{}
+	seen := map[string]struct{}{}
+	for _, message := range messages {
+		role := strings.ToLower(strings.TrimSpace(message.Role))
+		if role != "system" && role != "developer" {
+			continue
+		}
+		content := strings.TrimSpace(message.Content)
+		if content == "" {
+			continue
+		}
+		if responsesHiddenMessageUnsafeForVisible(content) {
+			content = responsesSanitizedVisibleInstructionContent(role, content)
+			if content == "" {
+				continue
+			}
+		}
+		const maxForwardedRunes = 4000
+		if utf8.RuneCountInString(content) > maxForwardedRunes {
+			content = truncateRunes(content, maxForwardedRunes) + "\n[truncated]"
+		}
+		key := role + "\n" + content
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		parts = append(parts, formatPromptSection(role, content))
+	}
+	return joinPromptParts(parts...)
+}
+
+func responsesSanitizedVisibleInstructionContent(role string, text string) string {
+	role = strings.ToLower(strings.TrimSpace(role))
+	if role == "" {
+		role = "system"
+	}
+	lower := strings.ToLower(text)
+	if strings.Contains(lower, "you are codex") || strings.Contains(lower, "apply_patch") || strings.Contains(lower, "exec_command") || strings.Contains(lower, "custom_tool_call") {
+		return "The upstream client provided " + role + " instructions. Follow the user-facing task and requested output format. For file edits, provide a concrete patch/diff instead of saying local file writing is unavailable."
+	}
+	return ""
+}
+
+func responsesHiddenMessageUnsafeForVisible(text string) bool {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return false
+	}
+	lower := strings.ToLower(text)
+	if utf8.RuneCountInString(text) > 8000 {
+		return true
+	}
+	for _, marker := range []string{
+		"you are codex",
+		"filesystem sandbox",
+		"sandbox_permissions",
+		"workspace_roots",
+		"tools are grouped by namespace",
+		"namespace functions",
+		"custom_tool_call",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	hits := 0
+	for _, marker := range []string{
+		"apply_patch",
+		"exec_command",
+		"function_call",
+		"tool_call",
+		"mcp",
+		"node_repl",
+		"developer message",
+		"system/developer",
+		"local filesystem",
+		"run shell",
+	} {
+		if strings.Contains(lower, marker) {
+			hits++
+		}
+	}
+	return hits >= 2
 }
 
 func promptAndHiddenFromResponsesInput(input any) (string, string, []hiddenPromptMessage) {
@@ -785,8 +963,11 @@ func responsesInputItemPromptParts(input any) (string, string, []hiddenPromptMes
 	}
 	role := strings.ToLower(strings.TrimSpace(stringFromAny(item["role"])))
 	itemType := strings.ToLower(strings.TrimSpace(stringFromAny(item["type"])))
-	if role == "tool" || itemType == "function_call_output" || itemType == "tool_result" {
+	if role == "tool" || itemType == "function_call_output" || itemType == "custom_tool_call_output" || itemType == "tool_result" {
 		return formatResponsesToolOutputForPrompt(item), "", nil
+	}
+	if itemType == "function_call" || itemType == "custom_tool_call" {
+		return formatResponsesToolCallForPrompt(item), "", nil
 	}
 	if role != "" || itemType == "message" {
 		if role == "" {
@@ -800,12 +981,62 @@ func responsesInputItemPromptParts(input any) (string, string, []hiddenPromptMes
 		case "system", "developer":
 			return "", formatPromptSection(role, text), []hiddenPromptMessage{{Role: role, Content: text}}
 		case "user":
-			return "user: " + strings.TrimSpace(text), "", nil
+			return formatRolePromptLine("user", text), "", nil
 		default:
-			return role + ": " + strings.TrimSpace(text), "", nil
+			return formatRolePromptLine(role, text), "", nil
 		}
 	}
 	return contentToText(item), "", nil
+}
+
+func formatRolePromptLine(role string, text string) string {
+	role = strings.ToLower(strings.TrimSpace(role))
+	text = strings.TrimSpace(text)
+	if role == "" || text == "" {
+		return ""
+	}
+	for {
+		rest, ok := stripRolePrefix(text, role)
+		if !ok {
+			break
+		}
+		rest = strings.TrimSpace(rest)
+		if rest == "" {
+			return ""
+		}
+		text = rest
+	}
+	return role + ": " + text
+}
+
+func normalizeRolePrefixesInPrompt(prompt string) string {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return ""
+	}
+	lines := strings.Split(strings.ReplaceAll(prompt, "\r\n", "\n"), "\n")
+	for idx, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		for _, role := range []string{"user", "assistant", "system", "developer"} {
+			if _, ok := stripRolePrefix(trimmed, role); ok {
+				lines[idx] = formatRolePromptLine(role, trimmed)
+				break
+			}
+		}
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func stripRolePrefix(text string, role string) (string, bool) {
+	text = strings.TrimSpace(text)
+	role = strings.ToLower(strings.TrimSpace(role))
+	lower := strings.ToLower(text)
+	for _, prefix := range []string{role + ":", role + "："} {
+		if strings.HasPrefix(lower, prefix) {
+			return strings.TrimSpace(text[len(prefix):]), true
+		}
+	}
+	return "", false
 }
 
 func legacyPromptFromResponsesInput(input any) string {
@@ -852,18 +1083,57 @@ func buildResponsesPayload(modelID string, answer string, usage dto.UsageDTO, re
 }
 
 func buildResponsesFunctionCallPayload(modelID string, toolName string, arguments string, callID string, usage dto.UsageDTO, responseID string, outputItemID string, createdAt int64, request map[string]any, trace map[string]any) map[string]any {
+	return buildResponsesFunctionCallPayloads(modelID, []responseFunctionToolCall{{
+		Name:      toolName,
+		Arguments: arguments,
+		CallID:    callID,
+		ItemID:    outputItemID,
+	}}, usage, responseID, createdAt, request, trace)
+}
+
+func buildResponsesFunctionCallPayloads(modelID string, calls []responseFunctionToolCall, usage dto.UsageDTO, responseID string, createdAt int64, request map[string]any, trace map[string]any) map[string]any {
+	if strings.TrimSpace(responseID) == "" {
+		responseID = newResponsesID("resp")
+	}
+	output := make([]any, 0, len(calls))
+	for _, call := range calls {
+		if strings.TrimSpace(call.ItemID) == "" {
+			call.ItemID = newResponsesID("fc")
+		}
+		if strings.TrimSpace(call.CallID) == "" {
+			call.CallID = newResponsesID("call")
+		}
+		output = append(output, buildResponsesFunctionCallItem(call.ItemID, call.Name, call.Arguments, call.CallID, "completed"))
+	}
+	if len(output) == 0 {
+		itemID := newResponsesID("fc")
+		callID := newResponsesID("call")
+		output = append(output, buildResponsesFunctionCallItem(itemID, "", "{}", callID, "completed"))
+	}
+	payload := buildResponsesBaseObject(responseID, modelID, createdAt, "completed", request)
+	payload["completed_at"] = createdAt
+	payload["output"] = output
+	payload["output_text"] = ""
+	payload["usage"] = buildResponsesUsage(usage)
+	if trace != nil {
+		payload["notion_trace"] = trace
+	}
+	return payload
+}
+
+func buildResponsesCustomToolCallPayload(modelID string, toolName string, input string, callID string, usage dto.UsageDTO, responseID string, outputItemID string, createdAt int64, request map[string]any, trace map[string]any) map[string]any {
 	if strings.TrimSpace(responseID) == "" {
 		responseID = newResponsesID("resp")
 	}
 	if strings.TrimSpace(outputItemID) == "" {
-		outputItemID = newResponsesID("fc")
+		outputItemID = newResponsesID("ctc")
 	}
 	if strings.TrimSpace(callID) == "" {
 		callID = newResponsesID("call")
 	}
 	payload := buildResponsesBaseObject(responseID, modelID, createdAt, "completed", request)
 	payload["completed_at"] = createdAt
-	payload["output"] = []any{buildResponsesFunctionCallItem(outputItemID, toolName, arguments, callID, "completed")}
+	payload["output"] = []any{buildResponsesCustomToolCallItem(outputItemID, toolName, input, callID, "completed")}
 	payload["output_text"] = ""
 	payload["usage"] = buildResponsesUsage(usage)
 	if trace != nil {
@@ -960,6 +1230,20 @@ func buildResponsesFunctionCallItem(itemID string, toolName string, arguments st
 	}
 }
 
+func buildResponsesCustomToolCallItem(itemID string, toolName string, input string, callID string, status string) map[string]any {
+	if strings.TrimSpace(status) == "" {
+		status = "completed"
+	}
+	return map[string]any{
+		"id":      itemID,
+		"type":    "custom_tool_call",
+		"status":  status,
+		"call_id": callID,
+		"name":    toolName,
+		"input":   input,
+	}
+}
+
 func responsesReasoningObject(request map[string]any) map[string]any {
 	reasoning := mapFromAny(valueOrNil(request, "reasoning"))
 	return map[string]any{
@@ -1024,7 +1308,7 @@ func metadataFromRequest(request map[string]any) map[string]any {
 }
 
 func hiddenPromptFromResponsesBody(body map[string]any) (string, []hiddenPromptMessage) {
-	instructions := strings.TrimSpace(stringFromAny(body["instructions"]))
+	instructions := strings.TrimSpace(firstNonEmpty(stringFromAny(body["instructions"]), stringFromAny(body["istructions"])))
 	if instructions == "" {
 		return "", nil
 	}
@@ -1114,7 +1398,7 @@ func responseToolOutputCallIDs(input any) []string {
 	case map[string]any:
 		role := strings.ToLower(strings.TrimSpace(stringFromAny(typed["role"])))
 		itemType := strings.ToLower(strings.TrimSpace(stringFromAny(typed["type"])))
-		if role == "tool" || itemType == "function_call_output" || itemType == "tool_result" {
+		if role == "tool" || itemType == "function_call_output" || itemType == "custom_tool_call_output" || itemType == "tool_result" {
 			if callID := stringFromAny(typed["call_id"]); callID != "" {
 				return []string{callID}
 			}
@@ -1147,7 +1431,13 @@ func maybeBuildCodexFileToolCallResult(modelID string, body map[string]any) (Com
 }
 
 func maybeBuildCodexAssistantTextToolCallResult(modelID string, body map[string]any, answer string, baseTrace map[string]any) (CompletionResult, bool) {
-	if body == nil || responsesInputHasToolOutput(body["input"]) || isCodexTitleGenerationRequest(body) {
+	if body == nil || isCodexTitleGenerationRequest(body) {
+		return CompletionResult{}, false
+	}
+	if result, ok := maybeBuildCodexApplyPatchToolCallResult(modelID, body, answer, baseTrace); ok {
+		return result, true
+	}
+	if responsesInputHasToolOutput(body["input"]) {
 		return CompletionResult{}, false
 	}
 	if !codexAssistantTextLooksLikeFileToolCall(answer) {
@@ -1163,13 +1453,152 @@ func maybeBuildCodexAssistantTextToolCallResult(modelID string, body map[string]
 	return buildCodexFileToolCallResult(modelID, body, files, "assistant_text_tool_call", baseTrace)
 }
 
-func buildCodexFileToolCallResult(modelID string, body map[string]any, files []string, reason string, baseTrace map[string]any) (CompletionResult, bool) {
-	toolName, args, ok := codexFileReadToolCall(body["tools"], files)
-	if !ok {
+func maybeBuildCodexDeterministicEditToolCallResult(modelID string, body map[string]any) (CompletionResult, bool) {
+	if body == nil || !responsesInputHasToolOutput(body["input"]) || responsesInputHasBlockingApplyPatchToolState(body["input"]) || isCodexTitleGenerationRequest(body) {
 		return CompletionResult{}, false
 	}
-	encodedArgs, err := json.Marshal(args)
-	if err != nil {
+	if !responseHasTool(body["tools"], "apply_patch") || !responseToolChoiceAllowsTool(body["tool_choice"], "apply_patch") {
+		return CompletionResult{}, false
+	}
+	prompt, hiddenPrompt, hiddenMessages := responsesPromptPartsFromBody(body)
+	if !codexPromptHasEditIntent(prompt) {
+		return CompletionResult{}, false
+	}
+	patch := codexDeterministicApplyPatchFromPrompt(prompt)
+	if patch == "" {
+		return CompletionResult{}, false
+	}
+	const maxPatchRunes = 200000
+	if utf8.RuneCountInString(patch) > maxPatchRunes {
+		return CompletionResult{}, false
+	}
+	usagePrompt := joinHiddenPromptParts(prompt, hiddenPrompt)
+	if usagePrompt == "" {
+		usagePrompt = legacyPromptFromResponsesInput(body["input"])
+	}
+	promptTokens := security.EstimateTokens(usagePrompt)
+	completionTokens := security.EstimateTokens(patch)
+	usage := dto.UsageDTO{
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+		TotalTokens:      promptTokens + completionTokens,
+		Estimated:        true,
+	}
+	trace := map[string]any{
+		"converted_only": true,
+		"tool_call": map[string]any{
+			"name":          "apply_patch",
+			"reason":        "deterministic_edit",
+			"input_chars":   utf8.RuneCountInString(patch),
+			"input_preview": truncateRunes(collapseWhitespace(patch), 180),
+		},
+	}
+	responseID := newResponsesID("resp")
+	callID := newResponsesID("call")
+	storePendingResponseContext(pendingResponseContext{
+		ResponseID:     responseID,
+		CallID:         callID,
+		Prompt:         prompt,
+		HiddenPrompt:   hiddenPrompt,
+		HiddenMessages: hiddenMessages,
+	})
+	payload := buildResponsesCustomToolCallPayload(modelID, "apply_patch", patch, callID, usage, responseID, newResponsesID("ctc"), time.Now().Unix(), body, trace)
+	return CompletionResult{Payload: payload, Usage: usage, Model: modelID, Trace: trace}, true
+}
+
+func maybeBuildCodexApplyPatchCompletionResult(modelID string, body map[string]any) (CompletionResult, bool) {
+	if body == nil || !responsesInputHasCustomToolCallOutput(body["input"]) || isCodexTitleGenerationRequest(body) {
+		return CompletionResult{}, false
+	}
+	if responsesInputHasUserMessageAfterCustomToolCallOutput(body["input"]) {
+		return CompletionResult{}, false
+	}
+	if !responsesInputHasApplyPatchToolCall(body["input"]) && !responseHasTool(body["tools"], "apply_patch") {
+		return CompletionResult{}, false
+	}
+	output := responsesFirstCustomToolCallOutputText(body["input"])
+	answer := codexApplyPatchCompletionAnswer(output)
+	prompt, hiddenPrompt, _ := responsesPromptPartsFromBody(body)
+	promptForUsage := joinHiddenPromptParts(prompt, hiddenPrompt)
+	if promptForUsage == "" {
+		promptForUsage = legacyPromptFromResponsesInput(body["input"])
+	}
+	promptTokens := security.EstimateTokens(promptForUsage)
+	completionTokens := security.EstimateTokens(answer)
+	usage := dto.UsageDTO{
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+		TotalTokens:      promptTokens + completionTokens,
+		Estimated:        true,
+	}
+	trace := map[string]any{
+		"converted_only": true,
+		"tool_result": map[string]any{
+			"name":           "apply_patch",
+			"reason":         "apply_patch_output_completion",
+			"output_chars":   utf8.RuneCountInString(output),
+			"output_preview": truncateRunes(collapseWhitespace(output), 180),
+		},
+	}
+	payload := buildResponsesPayload(modelID, answer, usage, newResponsesID("resp"), newResponsesID("msg"), time.Now().Unix(), body, trace)
+	return CompletionResult{Payload: payload, Usage: usage, Model: modelID, Text: answer, Trace: trace}, true
+}
+
+func maybeBuildCodexApplyPatchToolCallResult(modelID string, body map[string]any, answer string, baseTrace map[string]any) (CompletionResult, bool) {
+	if body == nil || !responseHasTool(body["tools"], "apply_patch") || !responseToolChoiceAllowsTool(body["tool_choice"], "apply_patch") || responsesInputHasBlockingApplyPatchToolState(body["input"]) {
+		return CompletionResult{}, false
+	}
+	prompt, hiddenPrompt, hiddenMessages := responsesPromptPartsFromBody(body)
+	if !codexPromptHasEditIntent(prompt) {
+		return CompletionResult{}, false
+	}
+	patch := codexApplyPatchFromAssistantText(answer, prompt)
+	if patch == "" {
+		return CompletionResult{}, false
+	}
+	const maxPatchRunes = 200000
+	if utf8.RuneCountInString(patch) > maxPatchRunes {
+		return CompletionResult{}, false
+	}
+	usagePrompt := joinHiddenPromptParts(prompt, hiddenPrompt)
+	if usagePrompt == "" {
+		usagePrompt = legacyPromptFromResponsesInput(body["input"])
+	}
+	promptTokens := security.EstimateTokens(usagePrompt)
+	completionTokens := security.EstimateTokens(patch)
+	usage := dto.UsageDTO{
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+		TotalTokens:      promptTokens + completionTokens,
+		Estimated:        true,
+	}
+	trace := map[string]any{}
+	for key, value := range baseTrace {
+		trace[key] = value
+	}
+	trace["assistant_text_tool_call_converted"] = true
+	trace["tool_call"] = map[string]any{
+		"name":          "apply_patch",
+		"reason":        "assistant_text_apply_patch",
+		"input_chars":   utf8.RuneCountInString(patch),
+		"input_preview": truncateRunes(collapseWhitespace(patch), 180),
+	}
+	responseID := newResponsesID("resp")
+	callID := newResponsesID("call")
+	storePendingResponseContext(pendingResponseContext{
+		ResponseID:     responseID,
+		CallID:         callID,
+		Prompt:         prompt,
+		HiddenPrompt:   hiddenPrompt,
+		HiddenMessages: hiddenMessages,
+	})
+	payload := buildResponsesCustomToolCallPayload(modelID, "apply_patch", patch, callID, usage, responseID, newResponsesID("ctc"), time.Now().Unix(), body, trace)
+	return CompletionResult{Payload: payload, Usage: usage, Model: modelID, Trace: trace}, true
+}
+
+func buildCodexFileToolCallResult(modelID string, body map[string]any, files []string, reason string, baseTrace map[string]any) (CompletionResult, bool) {
+	calls, ok := codexFileReadToolCalls(body["tools"], body["tool_choice"], files, boolFromMapDefault(body, "parallel_tool_calls", true))
+	if !ok || len(calls) == 0 {
 		return CompletionResult{}, false
 	}
 	prompt, hiddenPrompt, hiddenMessages := responsesPromptPartsFromBody(body)
@@ -1177,8 +1606,9 @@ func buildCodexFileToolCallResult(modelID string, body map[string]any, files []s
 	if promptForUsage == "" {
 		promptForUsage = legacyPromptFromResponsesInput(body["input"])
 	}
+	callBytes, _ := json.Marshal(calls)
 	promptTokens := security.EstimateTokens(promptForUsage)
-	completionTokens := security.EstimateTokens(string(encodedArgs))
+	completionTokens := security.EstimateTokens(string(callBytes))
 	usage := dto.UsageDTO{
 		PromptTokens:     promptTokens,
 		CompletionTokens: completionTokens,
@@ -1194,41 +1624,92 @@ func buildCodexFileToolCallResult(modelID string, body map[string]any, files []s
 	} else {
 		trace["assistant_text_tool_call_converted"] = true
 	}
+	traceCalls := make([]map[string]any, 0, len(calls))
+	callIDs := make([]string, 0, len(calls))
+	for idx := range calls {
+		if strings.TrimSpace(calls[idx].CallID) == "" {
+			calls[idx].CallID = newResponsesID("call")
+		}
+		if strings.TrimSpace(calls[idx].ItemID) == "" {
+			calls[idx].ItemID = newResponsesID("fc")
+		}
+		callIDs = append(callIDs, calls[idx].CallID)
+		var args any
+		_ = json.Unmarshal([]byte(calls[idx].Arguments), &args)
+		traceCalls = append(traceCalls, map[string]any{
+			"name":      calls[idx].Name,
+			"arguments": args,
+			"reason":    reason,
+		})
+	}
 	trace["tool_call"] = map[string]any{
-		"name":      toolName,
-		"arguments": args,
+		"name":      calls[0].Name,
+		"arguments": traceCalls[0]["arguments"],
 		"reason":    reason,
 	}
+	trace["tool_calls"] = traceCalls
 	responseID := newResponsesID("resp")
-	callID := newResponsesID("call")
 	storePendingResponseContext(pendingResponseContext{
 		ResponseID:     responseID,
-		CallID:         callID,
 		Prompt:         prompt,
 		HiddenPrompt:   hiddenPrompt,
 		HiddenMessages: hiddenMessages,
 	})
-	payload := buildResponsesFunctionCallPayload(modelID, toolName, string(encodedArgs), callID, usage, responseID, newResponsesID("fc"), time.Now().Unix(), body, trace)
+	for _, callID := range callIDs {
+		storePendingResponseContext(pendingResponseContext{
+			CallID:         callID,
+			Prompt:         prompt,
+			HiddenPrompt:   hiddenPrompt,
+			HiddenMessages: hiddenMessages,
+		})
+	}
+	payload := buildResponsesFunctionCallPayloads(modelID, calls, usage, responseID, time.Now().Unix(), body, trace)
 	return CompletionResult{Payload: payload, Usage: usage, Model: modelID, Trace: trace}, true
 }
 
-func codexFileReadToolCall(tools any, files []string) (string, map[string]any, bool) {
+func codexFileReadToolCalls(tools any, toolChoice any, files []string, parallel bool) ([]responseFunctionToolCall, bool) {
 	if len(files) == 0 {
-		return "", nil, false
+		return nil, false
 	}
 	switch {
-	case responseHasTool(tools, "connections.fs.readFiles"):
-		return "connections.fs.readFiles", map[string]any{"files": files}, true
-	case responseHasTool(tools, "connections.fs.readFile"):
-		return "connections.fs.readFile", map[string]any{"file": files[0]}, true
-	case responseHasTool(tools, "exec_command"):
-		return "exec_command", map[string]any{
-			"cmd":               codexReadFileCommand(files[0]),
-			"yield_time_ms":     10000,
-			"max_output_tokens": 20000,
-		}, true
+	case responseHasTool(tools, "connections.fs.readFiles") && responseToolChoiceAllowsTool(toolChoice, "connections.fs.readFiles"):
+		arguments, err := json.Marshal(map[string]any{"files": files})
+		if err != nil {
+			return nil, false
+		}
+		return []responseFunctionToolCall{{Name: "connections.fs.readFiles", Arguments: string(arguments)}}, true
+	case responseHasTool(tools, "connections.fs.readFile") && responseToolChoiceAllowsTool(toolChoice, "connections.fs.readFile"):
+		if !parallel && len(files) > 1 {
+			files = files[:1]
+		}
+		calls := make([]responseFunctionToolCall, 0, len(files))
+		for _, file := range files {
+			arguments, err := json.Marshal(map[string]any{"file": file})
+			if err != nil {
+				return nil, false
+			}
+			calls = append(calls, responseFunctionToolCall{Name: "connections.fs.readFile", Arguments: string(arguments)})
+		}
+		return calls, len(calls) > 0
+	case responseHasTool(tools, "exec_command") && responseToolChoiceAllowsTool(toolChoice, "exec_command"):
+		if !parallel && len(files) > 1 {
+			files = files[:1]
+		}
+		calls := make([]responseFunctionToolCall, 0, len(files))
+		for _, file := range files {
+			arguments, err := json.Marshal(map[string]any{
+				"cmd":               codexReadFileCommand(file),
+				"yield_time_ms":     10000,
+				"max_output_tokens": 20000,
+			})
+			if err != nil {
+				return nil, false
+			}
+			calls = append(calls, responseFunctionToolCall{Name: "exec_command", Arguments: string(arguments)})
+		}
+		return calls, len(calls) > 0
 	default:
-		return "", nil, false
+		return nil, false
 	}
 }
 
@@ -1254,6 +1735,68 @@ func responseHasTool(tools any, names ...string) bool {
 		}
 	}
 	return false
+}
+
+func responseToolChoiceAllowsTool(toolChoice any, toolName string) bool {
+	toolName = strings.TrimSpace(toolName)
+	if toolName == "" {
+		return false
+	}
+	mode, selectedName := responseToolChoiceMode(toolChoice)
+	switch mode {
+	case "none":
+		return false
+	case "named":
+		return strings.EqualFold(selectedName, toolName)
+	default:
+		return true
+	}
+}
+
+func responseToolChoiceMode(toolChoice any) (string, string) {
+	switch typed := toolChoice.(type) {
+	case nil:
+		return "auto", ""
+	case string:
+		mode := strings.ToLower(strings.TrimSpace(typed))
+		switch mode {
+		case "", "auto":
+			return "auto", ""
+		case "none":
+			return "none", ""
+		case "required":
+			return "required", ""
+		default:
+			return "named", typed
+		}
+	default:
+		choice := mapFromAny(toolChoice)
+		if choice == nil {
+			return "auto", ""
+		}
+		name := firstNonEmpty(
+			stringFromAny(choice["name"]),
+			stringFromAny(choice["tool_name"]),
+		)
+		if function := mapFromAny(choice["function"]); function != nil {
+			name = firstNonEmpty(name, stringFromAny(function["name"]))
+		}
+		if custom := mapFromAny(choice["custom"]); custom != nil {
+			name = firstNonEmpty(name, stringFromAny(custom["name"]))
+		}
+		if name != "" {
+			return "named", name
+		}
+		mode := strings.ToLower(strings.TrimSpace(stringFromAny(choice["type"])))
+		switch mode {
+		case "none":
+			return "none", ""
+		case "required":
+			return "required", ""
+		default:
+			return "auto", ""
+		}
+	}
 }
 
 func codexReadFileCommand(file string) string {
@@ -1362,6 +1905,479 @@ func codexFileRefsFromAssistantToolText(text string) []string {
 		}
 	}
 	return normalizeUniqueCodexFileRefs(files)
+}
+
+func codexApplyPatchFromAssistantText(text string, contextParts ...string) string {
+	for _, candidate := range codexPatchCandidates(text) {
+		if patch := normalizeCodexApplyPatch(candidate); patch != "" {
+			return patch
+		}
+		if patch := codexUnifiedDiffToApplyPatch(candidate); patch != "" {
+			return patch
+		}
+	}
+	if patch := codexInstructionalInsertionToApplyPatch(text, strings.Join(contextParts, "\n")); patch != "" {
+		return patch
+	}
+	return ""
+}
+
+func codexDeterministicApplyPatchFromPrompt(prompt string) string {
+	if patch := codexYAMLServerPortApplyPatch(prompt); patch != "" {
+		return patch
+	}
+	return ""
+}
+
+func codexYAMLServerPortApplyPatch(prompt string) string {
+	targetText := codexPromptBeforeContext(prompt)
+	newPort := codexRequestedPort(targetText)
+	if newPort == "" {
+		return ""
+	}
+	file := codexPatchTargetFile(targetText, prompt)
+	if file == "" {
+		return ""
+	}
+	contextLines, oldLine, newLine := codexYAMLServerPortLines(prompt, newPort)
+	if oldLine == "" || newLine == "" || oldLine == newLine {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("*** Begin Patch\n")
+	b.WriteString("*** Update File: ")
+	b.WriteString(file)
+	b.WriteString("\n")
+	b.WriteString("@@\n")
+	for _, line := range contextLines {
+		b.WriteString(" ")
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	b.WriteString("-")
+	b.WriteString(oldLine)
+	b.WriteString("\n")
+	b.WriteString("+")
+	b.WriteString(newLine)
+	b.WriteString("\n")
+	b.WriteString("*** End Patch\n")
+	return b.String()
+}
+
+func codexPromptBeforeContext(prompt string) string {
+	prompt = strings.TrimSpace(prompt)
+	prompt = codexToolResultBlockPattern.ReplaceAllString(prompt, "")
+	prompt = codexContextResultBlockPattern.ReplaceAllString(prompt, "")
+	return strings.TrimSpace(prompt)
+}
+
+func codexRequestedPort(text string) string {
+	text = strings.TrimSpace(text)
+	bestStart := -1
+	bestPort := ""
+	for _, pattern := range []string{
+		`(?i)(?:port|prot|端口)[^\d]{0,40}(\d{2,5})`,
+		`(?i)(?:改为|改成|改回|设置为|设为|to)\s*(\d{2,5})`,
+	} {
+		re := regexp.MustCompile(pattern)
+		for _, match := range re.FindAllStringSubmatchIndex(text, -1) {
+			if len(match) < 4 || match[2] < 0 || match[3] < 0 {
+				continue
+			}
+			if match[0] >= bestStart {
+				bestStart = match[0]
+				bestPort = text[match[2]:match[3]]
+			}
+		}
+	}
+	return bestPort
+}
+
+func codexYAMLServerPortLines(text string, newPort string) ([]string, string, string) {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	inServer := false
+	serverIndent := -1
+	context := []string{}
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			if inServer {
+				context = append(context, line)
+			}
+			continue
+		}
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		if trimmed == "server:" {
+			inServer = true
+			serverIndent = indent
+			context = []string{line}
+			continue
+		}
+		if inServer && indent <= serverIndent {
+			inServer = false
+			context = nil
+		}
+		if !inServer {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "port:") {
+			prefixLen := strings.Index(line, "port:")
+			if prefixLen < 0 {
+				return nil, "", ""
+			}
+			prefix := line[:prefixLen] + "port:"
+			oldValue := strings.TrimSpace(strings.TrimPrefix(line[prefixLen:], "port:"))
+			if oldValue == "" || oldValue == newPort {
+				return nil, "", ""
+			}
+			return context, line, prefix + " " + newPort
+		}
+		context = append(context, line)
+	}
+	return nil, "", ""
+}
+
+func codexPatchCandidates(text string) []string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	candidates := []string{text}
+	for _, match := range codexFencedCodePattern.FindAllStringSubmatch(text, -1) {
+		if len(match) >= 2 {
+			candidates = append(candidates, strings.TrimSpace(match[1]))
+		}
+	}
+	return candidates
+}
+
+type codexFencedCodeBlock struct {
+	Lang string
+	Body string
+}
+
+func codexFencedCodeBlocks(text string) []codexFencedCodeBlock {
+	blocks := []codexFencedCodeBlock{}
+	for _, match := range codexFencedCodeBlockPattern.FindAllStringSubmatch(text, -1) {
+		if len(match) >= 3 {
+			blocks = append(blocks, codexFencedCodeBlock{
+				Lang: strings.ToLower(strings.TrimSpace(match[1])),
+				Body: strings.TrimSpace(match[2]),
+			})
+		}
+	}
+	return blocks
+}
+
+func normalizeCodexApplyPatch(text string) string {
+	start := strings.Index(text, "*** Begin Patch")
+	if start < 0 {
+		return ""
+	}
+	end := strings.Index(text[start:], "*** End Patch")
+	if end < 0 {
+		return ""
+	}
+	patch := text[start : start+end+len("*** End Patch")]
+	return strings.TrimSpace(patch) + "\n"
+}
+
+func codexUnifiedDiffToApplyPatch(text string) string {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	type filePatch struct {
+		path  string
+		lines []string
+	}
+	patches := []filePatch{}
+	var current *filePatch
+	inHunk := false
+	flush := func() {
+		if current != nil && current.path != "" && len(current.lines) > 0 {
+			patches = append(patches, *current)
+		}
+		current = nil
+		inHunk = false
+	}
+	for _, line := range lines {
+		if strings.HasPrefix(line, "diff --git ") {
+			flush()
+			parts := strings.Fields(line)
+			if len(parts) >= 4 {
+				current = &filePatch{path: trimUnifiedDiffPath(parts[3])}
+			}
+			continue
+		}
+		if current == nil {
+			continue
+		}
+		if strings.HasPrefix(line, "+++ ") {
+			path := strings.TrimSpace(strings.TrimPrefix(line, "+++ "))
+			if path == "/dev/null" {
+				current = nil
+				inHunk = false
+				continue
+			}
+			current.path = trimUnifiedDiffPath(path)
+			continue
+		}
+		if strings.HasPrefix(line, "--- ") || strings.HasPrefix(line, "index ") || strings.HasPrefix(line, "new file mode ") || strings.HasPrefix(line, "deleted file mode ") {
+			continue
+		}
+		if strings.HasPrefix(line, "@@") {
+			inHunk = true
+			current.lines = append(current.lines, line)
+			continue
+		}
+		if inHunk {
+			if line == `\ No newline at end of file` {
+				continue
+			}
+			if strings.HasPrefix(line, " ") || strings.HasPrefix(line, "+") || strings.HasPrefix(line, "-") || line == "" {
+				current.lines = append(current.lines, line)
+			}
+		}
+	}
+	flush()
+	if len(patches) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("*** Begin Patch\n")
+	for _, patch := range patches {
+		if normalizeCodexFileRef(patch.path, patch.path) == "" {
+			return ""
+		}
+		b.WriteString("*** Update File: ")
+		b.WriteString(patch.path)
+		b.WriteString("\n")
+		for _, line := range patch.lines {
+			b.WriteString(line)
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("*** End Patch\n")
+	return b.String()
+}
+
+func trimUnifiedDiffPath(path string) string {
+	path = strings.TrimSpace(path)
+	path = strings.Trim(path, "\"")
+	path = strings.TrimPrefix(path, "a/")
+	path = strings.TrimPrefix(path, "b/")
+	return path
+}
+
+func codexInstructionalInsertionToApplyPatch(text string, context string) string {
+	file := codexPatchTargetFile(text, context)
+	if file == "" {
+		return ""
+	}
+	heading := codexInsertionHeading(text)
+	if heading == "" {
+		heading = codexInsertionHeading(context)
+	}
+	if heading == "" {
+		return ""
+	}
+	for _, block := range codexFencedCodeBlocks(text) {
+		if patch := codexPseudoDiffInsertionToApplyPatch(block.Body, file); patch != "" {
+			return patch
+		}
+	}
+	for _, block := range codexFencedCodeBlocks(text) {
+		if !codexFencedBlockLooksLikeMarkdownInsertion(block) {
+			continue
+		}
+		insert := codexMarkdownInsertionFromBlock(block.Body, heading)
+		if insert == "" {
+			continue
+		}
+		return codexBuildHeadingInsertionPatch(file, heading, insert)
+	}
+	return ""
+}
+
+func codexPatchTargetFile(text string, context string) string {
+	files := uniqueCodexFileRefs(
+		codexFileRefsFromText(text),
+		codexFileRefsFromText(context),
+		codexFileRefsFromBacktickMentions(text),
+		codexFileRefsFromBacktickMentions(context),
+	)
+	if len(files) == 0 {
+		return ""
+	}
+	return files[0]
+}
+
+func codexFileRefsFromBacktickMentions(text string) []string {
+	files := []string{}
+	for _, match := range codexBacktickContentPattern.FindAllStringSubmatch(text, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		raw := strings.TrimSpace(match[1])
+		if raw == "" || strings.Contains(raw, "\n") {
+			continue
+		}
+		if file := normalizeCodexFileRef(raw, raw); file != "" {
+			files = append(files, file)
+			continue
+		}
+		if strings.HasPrefix(raw, "/") {
+			clean := strings.TrimRight(raw, "/")
+			if idx := strings.LastIndex(clean, "/"); idx >= 0 {
+				clean = clean[idx+1:]
+			}
+			if file := normalizeCodexFileRef(clean, clean); file != "" {
+				files = append(files, file)
+			}
+		}
+	}
+	return normalizeUniqueCodexFileRefs(files)
+}
+
+func codexInsertionHeading(text string) string {
+	for _, block := range codexFencedCodeBlocks(text) {
+		if heading := firstMarkdownHeadingLine(block.Body); heading != "" {
+			return heading
+		}
+	}
+	if match := regexp.MustCompile("`(#{1,6}\\s+[^`\\n]{1,160})`").FindStringSubmatch(text); len(match) >= 2 {
+		return strings.TrimSpace(match[1])
+	}
+	return firstMarkdownHeadingLine(text)
+}
+
+func firstMarkdownHeadingLine(text string) string {
+	for _, line := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
+		line = strings.TrimSpace(strings.TrimPrefix(line, "+"))
+		if strings.HasPrefix(line, "#") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 && strings.HasPrefix(fields[0], "#") && strings.Trim(fields[0], "#") == "" {
+				return strings.TrimSpace(line)
+			}
+		}
+	}
+	return ""
+}
+
+func codexPseudoDiffInsertionToApplyPatch(text string, file string) string {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	heading := ""
+	inserted := []string{}
+	seenInsertion := false
+	for _, raw := range lines {
+		line := strings.TrimRight(raw, "\r")
+		if heading == "" {
+			clean := strings.TrimSpace(line)
+			if strings.HasPrefix(clean, "#") {
+				heading = strings.TrimSpace(clean)
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---") {
+			return ""
+		}
+		if strings.HasPrefix(line, "+") {
+			inserted = append(inserted, strings.TrimPrefix(line, "+"))
+			seenInsertion = true
+			continue
+		}
+		if seenInsertion && strings.TrimSpace(line) != "" {
+			break
+		}
+	}
+	if heading == "" || len(inserted) == 0 || !codexInsertedLinesLookUseful(inserted) {
+		return ""
+	}
+	return codexBuildHeadingInsertionPatch(file, heading, strings.TrimSpace(strings.Join(inserted, "\n")))
+}
+
+func codexFencedBlockLooksLikeMarkdownInsertion(block codexFencedCodeBlock) bool {
+	switch block.Lang {
+	case "", "md", "markdown", "text", "diff":
+	default:
+		return false
+	}
+	body := strings.TrimSpace(block.Body)
+	if body == "" || strings.Contains(body, "*** Begin Patch") || strings.Contains(body, "diff --git ") {
+		return false
+	}
+	if strings.HasPrefix(body, "curl ") || strings.HasPrefix(body, "curl\t") {
+		return false
+	}
+	return strings.Contains(body, "Responses") || strings.Contains(body, "LiteLLM") || strings.Contains(body, "注意")
+}
+
+func codexMarkdownInsertionFromBlock(text string, heading string) string {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	out := []string{}
+	headingSeen := false
+	for _, raw := range lines {
+		line := strings.TrimRight(raw, "\r")
+		clean := strings.TrimSpace(strings.TrimPrefix(line, "+"))
+		if !headingSeen {
+			if clean == heading {
+				headingSeen = true
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "+") {
+			out = append(out, strings.TrimPrefix(line, "+"))
+			continue
+		}
+		out = append(out, line)
+	}
+	if headingSeen {
+		return strings.TrimSpace(strings.Join(out, "\n"))
+	}
+	return strings.TrimSpace(text)
+}
+
+func codexInsertedLinesLookUseful(lines []string) bool {
+	return strings.TrimSpace(strings.Join(lines, "\n")) != ""
+}
+
+func codexBuildHeadingInsertionPatch(file string, heading string, insert string) string {
+	file = normalizeCodexFileRef(file, file)
+	heading = strings.TrimSpace(heading)
+	insert = strings.TrimSpace(insert)
+	if file == "" || heading == "" || insert == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("*** Begin Patch\n")
+	b.WriteString("*** Update File: ")
+	b.WriteString(file)
+	b.WriteString("\n")
+	b.WriteString("@@\n")
+	b.WriteString(" ")
+	b.WriteString(heading)
+	b.WriteString("\n")
+	if !strings.HasPrefix(insert, "\n") {
+		b.WriteString("+\n")
+	}
+	for _, line := range strings.Split(insert, "\n") {
+		b.WriteString("+")
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	b.WriteString("*** End Patch\n")
+	return b.String()
+}
+
+func codexPromptHasEditIntent(prompt string) bool {
+	lower := strings.ToLower(prompt)
+	for _, marker := range []string{
+		"修改", "改", "更新", "新增", "加上", "加到", "修复", "写入", "应用", "替换", "删除",
+		"edit", "modify", "update", "add", "fix", "write", "apply", "replace", "delete",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func codexTextHasFileReadIntent(text string) bool {
@@ -1473,7 +2489,7 @@ func responsesInputHasToolOutput(input any) bool {
 	case map[string]any:
 		role := strings.ToLower(strings.TrimSpace(stringFromAny(typed["role"])))
 		itemType := strings.ToLower(strings.TrimSpace(stringFromAny(typed["type"])))
-		if role == "tool" || itemType == "function_call_output" || itemType == "tool_result" {
+		if role == "tool" || itemType == "function_call_output" || itemType == "custom_tool_call_output" || itemType == "tool_result" {
 			return true
 		}
 		if content, ok := typed["content"]; ok {
@@ -1483,6 +2499,194 @@ func responsesInputHasToolOutput(input any) bool {
 	default:
 		return false
 	}
+}
+
+func responsesInputHasApplyPatchToolOutput(input any) bool {
+	switch typed := input.(type) {
+	case []any:
+		for _, item := range typed {
+			if responsesInputHasApplyPatchToolOutput(item) {
+				return true
+			}
+		}
+		return false
+	case []map[string]any:
+		for _, item := range typed {
+			if responsesInputHasApplyPatchToolOutput(item) {
+				return true
+			}
+		}
+		return false
+	case map[string]any:
+		itemType := strings.ToLower(strings.TrimSpace(stringFromAny(typed["type"])))
+		if itemType == "custom_tool_call" && strings.EqualFold(stringFromAny(typed["name"]), "apply_patch") {
+			return true
+		}
+		if itemType == "custom_tool_call_output" {
+			return true
+		}
+		return responsesInputHasApplyPatchToolOutput(typed["content"])
+	default:
+		return false
+	}
+}
+
+func responsesInputHasBlockingApplyPatchToolState(input any) bool {
+	return responsesInputHasApplyPatchToolOutput(input) && !responsesInputHasUserMessageAfterCustomToolCallOutput(input)
+}
+
+func responsesInputHasApplyPatchToolCall(input any) bool {
+	switch typed := input.(type) {
+	case []any:
+		for _, item := range typed {
+			if responsesInputHasApplyPatchToolCall(item) {
+				return true
+			}
+		}
+		return false
+	case []map[string]any:
+		for _, item := range typed {
+			if responsesInputHasApplyPatchToolCall(item) {
+				return true
+			}
+		}
+		return false
+	case map[string]any:
+		itemType := strings.ToLower(strings.TrimSpace(stringFromAny(typed["type"])))
+		if itemType == "custom_tool_call" && strings.EqualFold(stringFromAny(typed["name"]), "apply_patch") {
+			return true
+		}
+		return responsesInputHasApplyPatchToolCall(typed["content"])
+	default:
+		return false
+	}
+}
+
+func responsesInputHasUserMessageAfterCustomToolCallOutput(input any) bool {
+	seenOutput := false
+	foundUser := false
+	var walk func(any)
+	walk = func(value any) {
+		if foundUser {
+			return
+		}
+		switch typed := value.(type) {
+		case []any:
+			for _, item := range typed {
+				walk(item)
+				if foundUser {
+					return
+				}
+			}
+		case []map[string]any:
+			for _, item := range typed {
+				walk(item)
+				if foundUser {
+					return
+				}
+			}
+		case map[string]any:
+			itemType := strings.ToLower(strings.TrimSpace(stringFromAny(typed["type"])))
+			role := strings.ToLower(strings.TrimSpace(stringFromAny(typed["role"])))
+			if itemType == "custom_tool_call_output" {
+				seenOutput = true
+			}
+			if seenOutput && role == "user" && strings.TrimSpace(contentToText(typed["content"])) != "" {
+				foundUser = true
+				return
+			}
+			if content, ok := typed["content"]; ok {
+				walk(content)
+			}
+		}
+	}
+	walk(input)
+	return foundUser
+}
+
+func responsesInputHasCustomToolCallOutput(input any) bool {
+	switch typed := input.(type) {
+	case []any:
+		for _, item := range typed {
+			if responsesInputHasCustomToolCallOutput(item) {
+				return true
+			}
+		}
+		return false
+	case []map[string]any:
+		for _, item := range typed {
+			if responsesInputHasCustomToolCallOutput(item) {
+				return true
+			}
+		}
+		return false
+	case map[string]any:
+		itemType := strings.ToLower(strings.TrimSpace(stringFromAny(typed["type"])))
+		if itemType == "custom_tool_call_output" {
+			return true
+		}
+		return responsesInputHasCustomToolCallOutput(typed["content"])
+	default:
+		return false
+	}
+}
+
+func responsesFirstCustomToolCallOutputText(input any) string {
+	switch typed := input.(type) {
+	case []any:
+		for _, item := range typed {
+			if output := responsesFirstCustomToolCallOutputText(item); output != "" {
+				return output
+			}
+		}
+		return ""
+	case []map[string]any:
+		for _, item := range typed {
+			if output := responsesFirstCustomToolCallOutputText(item); output != "" {
+				return output
+			}
+		}
+		return ""
+	case map[string]any:
+		itemType := strings.ToLower(strings.TrimSpace(stringFromAny(typed["type"])))
+		if itemType == "custom_tool_call_output" {
+			return firstNonEmpty(responsesToolOutputText(typed["output"]), contentToText(typed["content"]))
+		}
+		return responsesFirstCustomToolCallOutputText(typed["content"])
+	default:
+		return ""
+	}
+}
+
+func codexApplyPatchCompletionAnswer(output string) string {
+	output = strings.TrimSpace(output)
+	lower := strings.ToLower(output)
+	switch {
+	case output == "":
+		return "apply_patch 已执行完成。"
+	case strings.Contains(lower, "success") || strings.Contains(output, "Updated the following files") || strings.Contains(output, "更新") || strings.Contains(output, "成功"):
+		if files := codexApplyPatchUpdatedFiles(output); len(files) > 0 {
+			return "修改已完成：" + strings.Join(files, "、")
+		}
+		return "修改已完成。"
+	default:
+		return "apply_patch 已返回结果，请查看工具输出确认修改状态。"
+	}
+}
+
+func codexApplyPatchUpdatedFiles(output string) []string {
+	lines := strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n")
+	files := []string{}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "M ") || strings.HasPrefix(line, "A ") || strings.HasPrefix(line, "D ") {
+			file := strings.TrimSpace(line[2:])
+			if file != "" {
+				files = append(files, file)
+			}
+		}
+	}
+	return files
 }
 
 func isCodexTitleGenerationRequest(body map[string]any) bool {
@@ -1527,6 +2731,31 @@ func formatResponsesToolOutputForPrompt(item map[string]any) string {
 	return "<tool_result " + strings.Join(attrs, " ") + ">\n" + strings.TrimSpace(output) + "\n</tool_result>"
 }
 
+func formatResponsesToolCallForPrompt(item map[string]any) string {
+	if item == nil {
+		return ""
+	}
+	name := firstNonEmpty(stringFromAny(item["name"]), stringFromAny(item["tool_name"]))
+	callID := stringFromAny(item["call_id"])
+	body := firstNonEmpty(stringFromAny(item["arguments"]), stringFromAny(item["input"]))
+	if body == "" {
+		if raw, err := json.Marshal(item); err == nil {
+			body = string(raw)
+		}
+	}
+	attrs := []string{}
+	if name != "" {
+		attrs = append(attrs, `name="`+strings.ReplaceAll(name, "\"", "'")+`"`)
+	}
+	if callID != "" {
+		attrs = append(attrs, `call_id="`+strings.ReplaceAll(callID, "\"", "'")+`"`)
+	}
+	if len(attrs) == 0 {
+		return "<tool_call>\n" + strings.TrimSpace(body) + "\n</tool_call>"
+	}
+	return "<tool_call " + strings.Join(attrs, " ") + ">\n" + strings.TrimSpace(body) + "\n</tool_call>"
+}
+
 func responsesToolOutputText(value any) string {
 	if value == nil {
 		return ""
@@ -1539,6 +2768,199 @@ func responsesToolOutputText(value any) string {
 		}
 	}
 	return contentToText(value)
+}
+
+func appendResponsesRequestControlInstructions(hiddenPrompt string, body map[string]any) string {
+	instructions := responsesSafeRequestControlInstructions(body)
+	if len(instructions) == 0 {
+		return strings.TrimSpace(hiddenPrompt)
+	}
+	control := formatPromptSection("openai_request_controls", strings.Join(instructions, "\n"))
+	return joinHiddenPromptParts(hiddenPrompt, control)
+}
+
+func responsesSafeRequestControlInstructions(body map[string]any) []string {
+	instructions := []string{}
+	if maxTokens, ok := positiveIntFromAny(valueOrNil(body, "max_output_tokens")); ok {
+		instructions = append(instructions, fmt.Sprintf("The client requested max_output_tokens=%d. Keep the final answer within roughly that many output tokens.", maxTokens))
+	}
+	if reasoning := mapFromAny(valueOrNil(body, "reasoning")); reasoning != nil {
+		parts := []string{}
+		if effort := strings.TrimSpace(stringFromAny(reasoning["effort"])); effort != "" {
+			parts = append(parts, "effort="+effort)
+		}
+		if summary := strings.TrimSpace(stringFromAny(reasoning["summary"])); summary != "" {
+			parts = append(parts, "summary="+summary)
+		}
+		if len(parts) > 0 {
+			instructions = append(instructions, "The client provided reasoning preferences ("+strings.Join(parts, ", ")+"). Use them internally, but do not reveal private chain-of-thought.")
+		}
+	}
+	if temp, ok := finiteNumberString(valueOrNil(body, "temperature")); ok {
+		instructions = append(instructions, "Approximate the client's temperature preference: "+temp+". Lower values should be more deterministic; higher values may be more exploratory.")
+	}
+	if topP, ok := finiteNumberString(valueOrNil(body, "top_p")); ok {
+		instructions = append(instructions, "Approximate the client's top_p preference: "+topP+".")
+	}
+	if toolInstruction := responseToolBridgeInstruction(body); toolInstruction != "" {
+		instructions = append(instructions, toolInstruction)
+	}
+	return instructions
+}
+
+func responseToolBridgeInstruction(body map[string]any) string {
+	tools := responseToolNames(valueOrNil(body, "tools"))
+	if len(tools) == 0 {
+		return ""
+	}
+	mode, selected := responseToolChoiceMode(valueOrNil(body, "tool_choice"))
+	switch mode {
+	case "none":
+		return "The client requested a direct answer. Do not emit patch-shaped text unless the user explicitly asks for a concrete edit."
+	case "named":
+		if strings.EqualFold(selected, "apply_patch") {
+			return "If the user asks for a file or document edit, provide a concrete text patch block instead of saying that file editing is unavailable."
+		}
+		return ""
+	default:
+		if responseHasTool(valueOrNil(body, "tools"), "apply_patch") {
+			return "If the user asks for a file or document edit, provide a concrete text patch block instead of saying that file editing is unavailable."
+		}
+		return ""
+	}
+}
+
+func responseToolNames(tools any) []string {
+	out := []string{}
+	seen := map[string]struct{}{}
+	for _, rawTool := range sliceFromAny(tools) {
+		tool := mapFromAny(rawTool)
+		if tool == nil {
+			continue
+		}
+		name := stringFromAny(tool["name"])
+		if function := mapFromAny(tool["function"]); function != nil {
+			name = firstNonEmpty(name, stringFromAny(function["name"]))
+		}
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+		if len(out) >= 20 {
+			break
+		}
+	}
+	return out
+}
+
+func applyResponsesInputTruncation(prompt string, body map[string]any) string {
+	if !strings.EqualFold(strings.TrimSpace(stringFromAny(valueOrNil(body, "truncation"))), "auto") {
+		return strings.TrimSpace(prompt)
+	}
+	const maxPromptRunes = 180000
+	runes := []rune(strings.TrimSpace(prompt))
+	if len(runes) <= maxPromptRunes {
+		return string(runes)
+	}
+	head := maxPromptRunes / 4
+	tail := maxPromptRunes - head
+	return string(runes[:head]) + "\n\n[notion2api: middle of prompt truncated because truncation=auto]\n\n" + string(runes[len(runes)-tail:])
+}
+
+func applyResponsesOutputLimit(answer string, body map[string]any) (string, map[string]any) {
+	maxTokens, ok := positiveIntFromAny(valueOrNil(body, "max_output_tokens"))
+	if !ok || maxTokens <= 0 {
+		return answer, nil
+	}
+	estimated := security.EstimateTokens(answer)
+	if estimated <= int64(maxTokens) {
+		return answer, nil
+	}
+	maxRunes := maxTokens * 4
+	if maxRunes < 1 {
+		maxRunes = 1
+	}
+	runes := []rune(answer)
+	if len(runes) > maxRunes {
+		answer = strings.TrimSpace(string(runes[:maxRunes]))
+	}
+	return answer, map[string]any{"reason": "max_output_tokens"}
+}
+
+func responseStoreEnabled(body map[string]any) bool {
+	return boolFromMapDefault(body, "store", true)
+}
+
+func positiveIntFromAny(value any) (int, bool) {
+	switch typed := value.(type) {
+	case int:
+		return typed, typed > 0
+	case int64:
+		return int(typed), typed > 0
+	case float64:
+		return int(typed), typed > 0
+	case json.Number:
+		i, err := typed.Int64()
+		if err == nil {
+			return int(i), i > 0
+		}
+		f, err := typed.Float64()
+		return int(f), err == nil && f > 0
+	default:
+		clean := strings.TrimSpace(stringFromAny(value))
+		if clean == "" {
+			return 0, false
+		}
+		var parsed json.Number = json.Number(clean)
+		i, err := parsed.Int64()
+		if err == nil {
+			return int(i), i > 0
+		}
+		f, err := parsed.Float64()
+		return int(f), err == nil && f > 0
+	}
+}
+
+func finiteNumberString(value any) (string, bool) {
+	switch typed := value.(type) {
+	case nil:
+		return "", false
+	case int:
+		return fmt.Sprintf("%d", typed), true
+	case int64:
+		return fmt.Sprintf("%d", typed), true
+	case float64:
+		return strconvFormatFloat(typed), true
+	case json.Number:
+		if _, err := typed.Float64(); err == nil {
+			return typed.String(), true
+		}
+		return "", false
+	default:
+		clean := strings.TrimSpace(stringFromAny(value))
+		if clean == "" {
+			return "", false
+		}
+		var parsed json.Number = json.Number(clean)
+		if _, err := parsed.Float64(); err != nil {
+			return "", false
+		}
+		return clean, true
+	}
+}
+
+func strconvFormatFloat(value float64) string {
+	raw := fmt.Sprintf("%.6f", value)
+	raw = strings.TrimRight(raw, "0")
+	raw = strings.TrimRight(raw, ".")
+	if raw == "" || raw == "-0" {
+		return "0"
+	}
+	return raw
 }
 
 func formatPromptSection(header string, body string) string {
@@ -1554,16 +2976,17 @@ func formatPromptSection(header string, body string) string {
 	}
 }
 
-func appendResponseFormatInstruction(hiddenPrompt string, responseFormat any) string {
+func appendResponseFormatInstruction(hiddenPrompt string, hiddenMessages []hiddenPromptMessage, responseFormat any) (string, []hiddenPromptMessage) {
 	hiddenPrompt = strings.TrimSpace(hiddenPrompt)
 	instruction := responseFormatInstruction(responseFormat)
 	if instruction == "" {
-		return hiddenPrompt
+		return hiddenPrompt, hiddenMessages
 	}
+	hiddenMessages = append(hiddenMessages, hiddenPromptMessage{Role: "system", Content: instruction})
 	if hiddenPrompt == "" {
-		return instruction
+		return instruction, hiddenMessages
 	}
-	return hiddenPrompt + "\n\n" + instruction
+	return hiddenPrompt + "\n\n" + instruction, hiddenMessages
 }
 
 func prependHiddenPromptInstructionEnvelope(prompt string, hiddenPrompt string) string {

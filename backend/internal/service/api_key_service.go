@@ -245,8 +245,20 @@ func (s *APIKeyService) RecordUsage(ctx context.Context, usage UsageRecord) erro
 	})
 }
 
-func (s *APIKeyService) Usage(ctx context.Context, filter repository.UsageFilter) ([]model.APIKeyUsage, error) {
-	return s.store.ListUsage(ctx, filter)
+func (s *APIKeyService) Usage(ctx context.Context, filter repository.UsageFilter) ([]dto.APIKeyUsageDTO, error) {
+	rows, err := s.store.ListUsage(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	keysByID, err := s.apiKeysByUsageID(ctx, rows)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]dto.APIKeyUsageDTO, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, APIKeyUsageDTO(row, keysByID))
+	}
+	return out, nil
 }
 
 func (s *APIKeyService) Logs(ctx context.Context, limit int) ([]dto.RequestLogDTO, error) {
@@ -261,6 +273,30 @@ func (s *APIKeyService) Logs(ctx context.Context, limit int) ([]dto.RequestLogDT
 	out := make([]dto.RequestLogDTO, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, RequestLogDTO(row, keysByID))
+	}
+	return out, nil
+}
+
+func (s *APIKeyService) apiKeysByUsageID(ctx context.Context, rows []model.APIKeyUsage) (map[uint]model.APIKey, error) {
+	seen := map[uint]struct{}{}
+	ids := make([]uint, 0)
+	for _, row := range rows {
+		if row.APIKeyID == 0 {
+			continue
+		}
+		if _, ok := seen[row.APIKeyID]; ok {
+			continue
+		}
+		seen[row.APIKeyID] = struct{}{}
+		ids = append(ids, row.APIKeyID)
+	}
+	keys, err := s.store.FindAPIKeysByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[uint]model.APIKey, len(keys))
+	for _, key := range keys {
+		out[key.ID] = key
 	}
 	return out, nil
 }
@@ -307,6 +343,33 @@ func APIKeyDTO(key model.APIKey) dto.APIKeyDTO {
 		TotalTokens:     key.TotalTokens,
 		CreatedAt:       key.CreatedAt,
 		UpdatedAt:       key.UpdatedAt,
+	}
+}
+
+func APIKeyUsageDTO(row model.APIKeyUsage, keysByID map[uint]model.APIKey) dto.APIKeyUsageDTO {
+	var keyName string
+	var keyValue string
+	var keyMasked string
+	if key, ok := keysByID[row.APIKeyID]; ok {
+		keyName = key.Name
+		keyValue = strings.TrimSpace(key.APIKey)
+		keyMasked = maskedAPIKey(key)
+	}
+	return dto.APIKeyUsageDTO{
+		ID:               row.ID,
+		APIKeyID:         row.APIKeyID,
+		APIKeyName:       keyName,
+		APIKey:           keyValue,
+		APIKeyMasked:     keyMasked,
+		Date:             row.Date,
+		Model:            row.Model,
+		RequestCount:     row.RequestCount,
+		PromptTokens:     row.PromptTokens,
+		CompletionTokens: row.CompletionTokens,
+		TotalTokens:      row.TotalTokens,
+		EstimatedTokens:  row.EstimatedTokens,
+		CreatedAt:        row.CreatedAt,
+		UpdatedAt:        row.UpdatedAt,
 	}
 }
 

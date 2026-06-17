@@ -45,6 +45,9 @@ export interface ModelRow {
 export interface UsageRow {
   id: number;
   api_key_id: number;
+  api_key_name?: string;
+  api_key: string;
+  api_key_masked?: string;
   date: string;
   model: string;
   request_count: number;
