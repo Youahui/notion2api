@@ -165,6 +165,61 @@ func TestResponseStickySessionKeysPrioritizePreviousResponseID(t *testing.T) {
 	}
 }
 
+func TestResponseStickySessionKeysIncludeToolOutputCallID(t *testing.T) {
+	keys := responseStickySessionKeys(map[string]any{
+		"input": []any{
+			map[string]any{"type": "function_call_output", "call_id": "call_read", "output": "content"},
+		},
+	}, OpenAIRequestOptions{APIKeyID: 7})
+
+	found := false
+	for _, key := range keys {
+		if key.Key == responseStickyKey(7, "call_read") && key.Source == "tool_call_id" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected tool output call id sticky key, got %+v", keys)
+	}
+}
+
+func TestOpenAIServiceBindsLocalResponseToExistingStickyThread(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	sticky := newMemoryStickySessionStore(time.Minute)
+	if err := sticky.Set(ctx, StickyThreadBinding{
+		StickyKey:    responseStickyKey(7, "resp_prev"),
+		ThreadID:     "notion-thread-1",
+		AccountID:    42,
+		AccountEmail: "owner@example.com",
+	}, time.Minute); err != nil {
+		t.Fatalf("set previous response binding: %v", err)
+	}
+	svc := &OpenAIService{cfg: cfg, sticky: sticky}
+	result := CompletionResult{Payload: map[string]any{
+		"id": "resp_local",
+		"output": []any{
+			map[string]any{"type": "function_call", "call_id": "call_local", "name": "exec_command", "arguments": "{}"},
+		},
+	}}
+
+	svc.bindLocalResponseToExistingSticky(ctx, map[string]any{"previous_response_id": "resp_prev"}, OpenAIRequestOptions{APIKeyID: 7}, result)
+
+	for _, id := range []string{"resp_local", "call_local"} {
+		got, ok, err := sticky.Get(ctx, responseStickyKey(7, id))
+		if err != nil {
+			t.Fatalf("get local binding %s: %v", id, err)
+		}
+		if !ok {
+			t.Fatalf("expected local binding for %s", id)
+		}
+		if got.ThreadID != "notion-thread-1" || got.AccountID != 42 {
+			t.Fatalf("unexpected local binding for %s: %+v", id, got)
+		}
+	}
+}
+
 func TestParseRedisStickyURL(t *testing.T) {
 	addr, username, password, db, err := parseRedisStickyURL("redis://user:secret@localhost:6380/2")
 	if err != nil {

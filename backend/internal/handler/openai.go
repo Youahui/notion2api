@@ -136,6 +136,29 @@ func (h *Handler) streamChatCompletion(c *gin.Context, result service.Completion
 	c.Header("Connection", "keep-alive")
 	c.Status(http.StatusOK)
 
+	if toolCalls := chatCompletionToolCalls(result.Payload); len(toolCalls) > 0 {
+		chunk := map[string]any{
+			"id":      result.Payload["id"],
+			"object":  "chat.completion.chunk",
+			"created": time.Now().Unix(),
+			"model":   result.Model,
+			"choices": []map[string]any{
+				{
+					"index": 0,
+					"delta": map[string]any{
+						"role":       "assistant",
+						"tool_calls": toolCalls,
+					},
+					"finish_reason": "tool_calls",
+				},
+			},
+		}
+		encoded, _ := json.Marshal(chunk)
+		writeSSE(c.Writer, "", encoded)
+		writeSSEDone(c.Writer)
+		return
+	}
+
 	chunk := map[string]any{
 		"id":      result.Payload["id"],
 		"object":  "chat.completion.chunk",
@@ -155,6 +178,39 @@ func (h *Handler) streamChatCompletion(c *gin.Context, result service.Completion
 	encoded, _ := json.Marshal(chunk)
 	writeSSE(c.Writer, "", encoded)
 	writeSSEDone(c.Writer)
+}
+
+func chatCompletionToolCalls(payload map[string]any) []any {
+	for _, rawChoice := range handlerSliceFromAny(payload["choices"]) {
+		choice := handlerMapFromAny(rawChoice)
+		message := handlerMapFromAny(choice["message"])
+		if calls := handlerSliceFromAny(message["tool_calls"]); len(calls) > 0 {
+			return calls
+		}
+	}
+	return nil
+}
+
+func handlerMapFromAny(value any) map[string]any {
+	if typed, ok := value.(map[string]any); ok {
+		return typed
+	}
+	return nil
+}
+
+func handlerSliceFromAny(value any) []any {
+	switch typed := value.(type) {
+	case []any:
+		return typed
+	case []map[string]any:
+		out := make([]any, 0, len(typed))
+		for _, item := range typed {
+			out = append(out, item)
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func (h *Handler) streamResponse(c *gin.Context, result service.CompletionResult) {

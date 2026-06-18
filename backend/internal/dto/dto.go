@@ -75,8 +75,12 @@ type UpdateAPIKeyRequest struct {
 }
 
 type ChatMessage struct {
-	Role    string `json:"role"`
-	Content any    `json:"content"`
+	Role         string `json:"role"`
+	Content      any    `json:"content"`
+	Name         string `json:"name,omitempty"`
+	ToolCallID   string `json:"tool_call_id,omitempty"`
+	ToolCalls    any    `json:"tool_calls,omitempty"`
+	FunctionCall any    `json:"function_call,omitempty"`
 }
 
 type ChatCompletionRequest struct {
@@ -96,6 +100,8 @@ type ChatCompletionRequest struct {
 	ResponseFormat     any           `json:"response_format"`
 	Metadata           any           `json:"metadata"`
 	Tools              any           `json:"tools"`
+	ToolChoice         any           `json:"tool_choice"`
+	ParallelToolCalls  *bool         `json:"parallel_tool_calls"`
 	Attachments        any           `json:"attachments"`
 }
 

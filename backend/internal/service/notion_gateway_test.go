@@ -461,6 +461,38 @@ func TestRunPromptPrefersSyncedAnswerAfterCompletedStream(t *testing.T) {
 	}
 }
 
+func TestBuildPayloadUsesPartialTranscriptForExistingThread(t *testing.T) {
+	gateway := NewNotionGateway(config.Default())
+	payload, threadID := gateway.BuildPayload(model.Account{
+		Email:   "user@example.com",
+		UserID:  "user-id",
+		SpaceID: "space-id",
+	}, NotionPromptRequest{
+		Prompt:           "user: 继续",
+		UpstreamThreadID: "notion-thread-1",
+	})
+
+	if threadID != "notion-thread-1" || payload["threadId"] != "notion-thread-1" {
+		t.Fatalf("expected existing thread id, got threadID=%q payload=%#v", threadID, payload["threadId"])
+	}
+	if payload["createThread"] != false || payload["generateTitle"] != false || payload["saveAllThreadOperations"] != false {
+		t.Fatalf("existing thread should not create/title/save all operations: %#v", payload)
+	}
+	if payload["isPartialTranscript"] != true {
+		t.Fatalf("existing thread should use partial transcript, got %#v", payload["isPartialTranscript"])
+	}
+	if _, ok := payload["threadParentPointer"]; ok {
+		t.Fatalf("existing thread should not set thread parent pointer: %#v", payload["threadParentPointer"])
+	}
+	transcript, ok := payload["transcript"].([]map[string]any)
+	if !ok || len(transcript) != 1 {
+		t.Fatalf("expected one user transcript step, got %#v", payload["transcript"])
+	}
+	if transcript[0]["type"] != "user" {
+		t.Fatalf("expected user step only, got %#v", transcript)
+	}
+}
+
 func TestExtractNotionTextFromSnakeCaseRecordMap(t *testing.T) {
 	want := `{"ok":true,"message":"connected"}`
 	recordMap := map[string]any{

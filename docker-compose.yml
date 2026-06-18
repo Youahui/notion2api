@@ -6,7 +6,7 @@ services:
     container_name: notaion2api-backend
     restart: unless-stopped
     ports:
-      - "${N2A_PORT:-9998}:9998"
+      - "${N2A_PORT:-9991}:9998"
     volumes:
       - ./backend/configs/config.docker.yaml:/app/config/config.yaml:ro
       - ./data:/app/data

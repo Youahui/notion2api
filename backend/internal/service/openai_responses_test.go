@@ -163,7 +163,7 @@ func TestResponsesNotionVisiblePromptSanitizesUnsafeSystemSections(t *testing.T)
 		{Role: "system", Content: "You are Codex. Use apply_patch and exec_command with the local filesystem sandbox."},
 	})
 
-	for _, want := range []string{"[system]", "concrete patch/diff", "user: Update a file."} {
+	for _, want := range []string{"[system]", "Codex-compatible system instructions", "concrete patch/diff", "user: Update a file."} {
 		if !strings.Contains(notionPrompt, want) {
 			t.Fatalf("expected notion prompt to contain %q, got %q", want, notionPrompt)
 		}
@@ -203,6 +203,119 @@ func TestResponsesNotionVisiblePromptNormalizesRepeatedRolePrefixes(t *testing.T
 	}
 	if !strings.HasPrefix(notionPrompt, "user: [config.docker.yaml]") {
 		t.Fatalf("unexpected normalized prompt: %q", notionPrompt)
+	}
+}
+
+func TestResponsesPromptPartsFromBodyAppendsCurrentUserRequestForMultiTurnInput(t *testing.T) {
+	body := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "[config.docker.yaml](notion2api/backend/configs/config.docker.yaml) 帮我尝试将 server prot 改为9999"},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "assistant",
+				"content": []any{
+					map[string]any{"type": "output_text", "text": "修改已完成。"},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "改回9998"},
+				},
+			},
+		},
+	}
+
+	prompt, _, _ := responsesPromptPartsFromBody(body)
+	if !strings.Contains(prompt, "[current_user_request]") {
+		t.Fatalf("expected current request section, got %q", prompt)
+	}
+	if !strings.Contains(prompt, "Treat this as the active request for this turn:\nuser: 改回9998") {
+		t.Fatalf("expected latest user request to be explicit, got %q", prompt)
+	}
+	if !strings.HasSuffix(prompt, "user: 改回9998") {
+		t.Fatalf("current request should be last, got %q", prompt)
+	}
+	if strings.Contains(prompt, "帮我尝试将 server prot 改为9999") || strings.Contains(prompt, "修改已完成") {
+		t.Fatalf("prompt should not keep completed historical turn, got %q", prompt)
+	}
+}
+
+func TestResponsesPromptPartsFromBodySkipsCodexCompactionContext(t *testing.T) {
+	body := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Another language model started to solve this problem and produced a summary of its thinking process.\n\n## Handoff Summary\n\n### 当前进展 / 已做决策\n- 旧任务已经完成。\n"},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "帮我更新 [docker-compose.yml](notion2api/docker-compose.yml) 的 server port 为 9991"},
+				},
+			},
+		},
+	}
+
+	prompt, _, _ := responsesPromptPartsFromBody(body)
+	for _, forbidden := range []string{"Another language model", "Handoff Summary", "旧任务已经完成"} {
+		if strings.Contains(prompt, forbidden) {
+			t.Fatalf("prompt should drop internal compaction context %q: %q", forbidden, prompt)
+		}
+	}
+	if !strings.Contains(prompt, "server port 为 9991") {
+		t.Fatalf("prompt should keep latest real user request, got %q", prompt)
+	}
+}
+
+func TestMaybeBuildCodexCompactionResultHandlesLocally(t *testing.T) {
+	body := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "帮我更新 [docker-compose.yml](notion2api/docker-compose.yml) 的 server port 为 9991"},
+				},
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_read",
+				"output":  "services:\n  backend:\n    ports:\n      - \"${N2A_PORT:-9998}:9998\"\n",
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "You are performing a COPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task."},
+				},
+			},
+		},
+	}
+
+	result, ok := maybeBuildCodexCompactionResult("gpt-test", body)
+	if !ok {
+		t.Fatal("expected compaction request to be handled locally")
+	}
+	text := result.Payload["output_text"].(string)
+	for _, want := range []string{"Handoff Summary", "server port 为 9991", "不要重复"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected local summary to contain %q, got %q", want, text)
+		}
+	}
+	if trace := result.Payload["notion_trace"].(map[string]any); trace["local_reason"] != "codex_compaction" {
+		t.Fatalf("expected local compaction trace, got %#v", trace)
 	}
 }
 
@@ -325,6 +438,128 @@ func TestMaybeBuildCodexFileToolCallResultUsesExecCommand(t *testing.T) {
 	}
 	if result.Payload["output_text"] != "" {
 		t.Fatalf("function call response should not include text output: %#v", result.Payload["output_text"])
+	}
+}
+
+func TestMaybeBuildCodexFileToolCallResultAllowsNewReadAfterToolOutput(t *testing.T) {
+	body := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "[README.md](notion2api/README.md) 帮我修改说明"},
+				},
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_read",
+				"output":  "# README\n",
+			},
+			map[string]any{
+				"type": "message",
+				"role": "assistant",
+				"content": []any{
+					map[string]any{"type": "output_text", "text": "README 已处理。"},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "帮我查看 [Dockerfile](notion2api/Dockerfile)"},
+				},
+			},
+		},
+		"tools": []any{
+			map[string]any{"type": "function", "name": "exec_command"},
+		},
+	}
+
+	result, ok := maybeBuildCodexFileToolCallResult("gpt-test", body)
+	if !ok {
+		t.Fatal("expected new user file request after tool output to produce a tool call")
+	}
+	output := result.Payload["output"].([]any)
+	item := output[0].(map[string]any)
+	defer pendingResponseContexts.Delete("resp:" + result.Payload["id"].(string))
+	defer pendingResponseContexts.Delete("call:" + item["call_id"].(string))
+	var args map[string]any
+	if err := json.Unmarshal([]byte(item["arguments"].(string)), &args); err != nil {
+		t.Fatalf("invalid arguments json: %v", err)
+	}
+	cmd := args["cmd"].(string)
+	if !strings.Contains(cmd, "notion2api/Dockerfile") {
+		t.Fatalf("expected latest Dockerfile request, got %q", cmd)
+	}
+	if strings.Contains(cmd, "README.md") {
+		t.Fatalf("should not reuse historical README request, got %q", cmd)
+	}
+}
+
+func TestMaybeBuildCodexFileToolCallResultSkipsImmediatelyAfterToolOutput(t *testing.T) {
+	body := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "帮我查看 [Dockerfile](Dockerfile)"},
+				},
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_read",
+				"output":  "FROM alpine\n",
+			},
+		},
+		"tools": []any{
+			map[string]any{"type": "function", "name": "exec_command"},
+		},
+	}
+
+	if _, ok := maybeBuildCodexFileToolCallResult("gpt-test", body); ok {
+		t.Fatal("tool output follow-up should be sent to Notion for answer synthesis, not produce another file read")
+	}
+}
+
+func TestMaybeBuildCodexFileToolCallResultDoesNotReuseOldFileWhenLatestUserHasNoFile(t *testing.T) {
+	body := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "[README.md](notion2api/README.md) 帮我总结"},
+				},
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_read",
+				"output":  "# README\n",
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "继续说明风险"},
+				},
+			},
+		},
+		"tools": []any{
+			map[string]any{"type": "function", "name": "exec_command"},
+		},
+	}
+
+	if _, ok := maybeBuildCodexFileToolCallResult("gpt-test", body); ok {
+		t.Fatal("latest user message without a file should not reuse historical file refs")
+	}
+}
+
+func TestCodexFileRefsFromTextRejectsSentenceFragments(t *testing.T) {
+	files := codexFileRefsFromText("请读取 docker-compose.yml。The model. should not read work. or 1. as files.")
+	if len(files) != 1 || files[0] != "docker-compose.yml" {
+		t.Fatalf("expected only docker-compose.yml, got %#v", files)
 	}
 }
 

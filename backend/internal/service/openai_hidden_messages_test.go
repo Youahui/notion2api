@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -30,6 +31,92 @@ func TestNormalizeChatMessagesExtractsSystemAndDeveloper(t *testing.T) {
 	}
 	if hiddenMessages[0].Role != "system" || hiddenMessages[1].Role != "developer" {
 		t.Fatalf("unexpected hidden message roles: %#v", hiddenMessages)
+	}
+}
+
+func TestNormalizeChatMessagesForNotionUsesCurrentTurnWhenContinuing(t *testing.T) {
+	prompt, hiddenPrompt, hiddenMessages := normalizeChatMessagesForNotion([]dto.ChatMessage{
+		{Role: "system", Content: "Return JSON only."},
+		{Role: "user", Content: "第一轮"},
+		{Role: "assistant", Content: "第一轮回答"},
+		{Role: "user", Content: "第二轮"},
+	}, true)
+
+	if strings.Contains(prompt, "第一轮") || strings.Contains(prompt, "第一轮回答") {
+		t.Fatalf("continuing thread should only send current turn, got %q", prompt)
+	}
+	if !strings.Contains(prompt, "user: 第二轮") {
+		t.Fatalf("expected current user turn, got %q", prompt)
+	}
+	if !strings.Contains(hiddenPrompt, "[system]\nReturn JSON only.") || len(hiddenMessages) != 1 {
+		t.Fatalf("expected hidden system instruction to be preserved, got %q %#v", hiddenPrompt, hiddenMessages)
+	}
+}
+
+func TestMaybeBuildCodexChatFileToolCallResultUsesChatToolCalls(t *testing.T) {
+	req := dto.ChatCompletionRequest{
+		Model: "gpt-test",
+		Messages: []dto.ChatMessage{
+			{Role: "user", Content: "帮我查看 [Dockerfile](Dockerfile)"},
+		},
+		Tools: []any{
+			map[string]any{"type": "function", "function": map[string]any{"name": "exec_command"}},
+		},
+	}
+
+	result, ok := maybeBuildCodexChatFileToolCallResult("gpt-test", req)
+	if !ok {
+		t.Fatal("expected chat file request to produce tool_calls")
+	}
+	choices := result.Payload["choices"].([]map[string]any)
+	message := choices[0]["message"].(map[string]any)
+	toolCalls := message["tool_calls"].([]map[string]any)
+	call := toolCalls[0]
+	function := call["function"].(map[string]any)
+	if function["name"] != "exec_command" {
+		t.Fatalf("expected exec_command tool call, got %#v", function)
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(function["arguments"].(string)), &args); err != nil {
+		t.Fatalf("invalid tool arguments: %v", err)
+	}
+	if !strings.Contains(args["cmd"].(string), "Dockerfile") {
+		t.Fatalf("expected Dockerfile command, got %#v", args)
+	}
+	if choices[0]["finish_reason"] != "tool_calls" {
+		t.Fatalf("expected tool_calls finish reason, got %#v", choices[0])
+	}
+}
+
+func TestChatStickySessionKeysMatchAnswerHistoryOnNextTurn(t *testing.T) {
+	req := dto.ChatCompletionRequest{
+		Model: "gpt-test",
+		Messages: []dto.ChatMessage{
+			{Role: "user", Content: "第一轮"},
+		},
+	}
+	answerKeys := chatCompletionAnswerStickyKeys(req, "第一轮回答", OpenAIRequestOptions{APIKeyID: 7})
+	if len(answerKeys) != 1 || answerKeys[0].Key == "" {
+		t.Fatalf("expected answer history key, got %+v", answerKeys)
+	}
+	next := dto.ChatCompletionRequest{
+		Model: "gpt-test",
+		Messages: []dto.ChatMessage{
+			{Role: "user", Content: "第一轮"},
+			{Role: "assistant", Content: "第一轮回答"},
+			{Role: "user", Content: "第二轮"},
+		},
+	}
+	keys := chatStickySessionKeys(next, OpenAIRequestOptions{APIKeyID: 7})
+	found := false
+	for _, key := range keys {
+		if key.Key == answerKeys[0].Key {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected next turn to include previous answer history key %q, got %+v", answerKeys[0].Key, keys)
 	}
 }
 

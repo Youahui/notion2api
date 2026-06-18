@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -131,13 +133,18 @@ func (s *OpenAIService) ChatCompletion(ctx context.Context, req dto.ChatCompleti
 		return CompletionResult{}, err
 	}
 	threadID := firstNonEmpty(req.ThreadID, req.Thread, req.NotionThreadID, stringFromMetadata(req.Metadata, "thread_id", "notion_thread_id"))
+	if result, ok := maybeBuildCodexChatFileToolCallResult(row.PublicID, req); ok {
+		s.bindLocalChatResponseToExistingSticky(ctx, req, options, result)
+		logCodexToolCallConversion(options, result)
+		return result, nil
+	}
 	sessionKeys := chatStickySessionKeys(req, options)
 	selection, err := s.selectAccountForStickyKeys(ctx, requestedAccountEmail(req.AccountEmail, req.NotionAccountEmail, req.Metadata), threadID, sessionKeys)
 	if err != nil {
 		return CompletionResult{}, err
 	}
 	account := selection.Account
-	prompt, hiddenPrompt, hiddenMessages := normalizeChatMessages(req.Messages)
+	prompt, hiddenPrompt, hiddenMessages := normalizeChatMessagesForNotion(req.Messages, selection.ThreadID != "")
 	hiddenPrompt, hiddenMessages = appendResponseFormatInstruction(hiddenPrompt, hiddenMessages, req.ResponseFormat)
 	notionPrompt := prependHiddenPromptInstructionEnvelope(prompt, hiddenPrompt)
 	useWebSearch := s.cfg.Features.WebSearch
@@ -168,8 +175,9 @@ func (s *OpenAIService) ChatCompletion(ctx context.Context, req dto.ChatCompleti
 		return CompletionResult{}, err
 	}
 	s.accounts.MarkSuccess(ctx, account.ID)
-	s.bindStickyThread(ctx, account, notionResult, sessionKeys, "", options.APIKeyID)
 	answer := notionResult.Text
+	sessionKeys = appendUniqueStickyKeys(sessionKeys, chatCompletionAnswerStickyKeys(req, answer, options))
+	s.bindStickyThread(ctx, account, notionResult, sessionKeys, "", options.APIKeyID)
 	promptTokens := security.EstimateTokens(firstNonEmpty(notionPrompt, prompt, hiddenPrompt))
 	completionTokens := security.EstimateTokens(answer)
 	usage := dto.UsageDTO{
@@ -212,6 +220,102 @@ func (s *OpenAIService) ChatCompletion(ctx context.Context, req dto.ChatCompleti
 	return CompletionResult{Payload: payload, Usage: usage, Model: row.PublicID, Text: answer, Trace: payload["notion_trace"].(map[string]any)}, nil
 }
 
+func maybeBuildCodexChatFileToolCallResult(modelID string, req dto.ChatCompletionRequest) (CompletionResult, bool) {
+	if chatMessagesHaveToolOutput(req.Messages) || isCodexChatTitleGenerationRequest(req.Messages) {
+		return CompletionResult{}, false
+	}
+	files := codexFileRefsFromChatMessages(req.Messages)
+	if len(files) == 0 {
+		return CompletionResult{}, false
+	}
+	parallel := true
+	if req.ParallelToolCalls != nil {
+		parallel = *req.ParallelToolCalls
+	}
+	calls, ok := codexFileReadToolCalls(req.Tools, req.ToolChoice, files, parallel)
+	if !ok || len(calls) == 0 {
+		return CompletionResult{}, false
+	}
+	prompt, hiddenPrompt, _ := normalizeChatMessages(req.Messages)
+	usagePrompt := joinHiddenPromptParts(prompt, hiddenPrompt)
+	if usagePrompt == "" {
+		usagePrompt = prompt
+	}
+	callBytes, _ := json.Marshal(calls)
+	usage := dto.UsageDTO{
+		PromptTokens:     security.EstimateTokens(usagePrompt),
+		CompletionTokens: security.EstimateTokens(string(callBytes)),
+		TotalTokens:      security.EstimateTokens(usagePrompt) + security.EstimateTokens(string(callBytes)),
+		Estimated:        true,
+	}
+	traceCalls := make([]map[string]any, 0, len(calls))
+	for idx := range calls {
+		if strings.TrimSpace(calls[idx].CallID) == "" {
+			calls[idx].CallID = newResponsesID("call")
+		}
+		var args any
+		_ = json.Unmarshal([]byte(calls[idx].Arguments), &args)
+		traceCalls = append(traceCalls, map[string]any{
+			"name":      calls[idx].Name,
+			"arguments": args,
+			"reason":    "chat_codex_file_reference",
+		})
+	}
+	trace := map[string]any{
+		"converted_only": true,
+		"tool_call": map[string]any{
+			"name":      calls[0].Name,
+			"arguments": traceCalls[0]["arguments"],
+			"reason":    "chat_codex_file_reference",
+		},
+		"tool_calls": traceCalls,
+	}
+	payload := buildChatToolCallPayload(modelID, calls, usage, trace)
+	return CompletionResult{Payload: payload, Usage: usage, Model: modelID, Trace: trace}, true
+}
+
+func buildChatToolCallPayload(modelID string, calls []responseFunctionToolCall, usage dto.UsageDTO, trace map[string]any) map[string]any {
+	toolCalls := make([]map[string]any, 0, len(calls))
+	for _, call := range calls {
+		if strings.TrimSpace(call.CallID) == "" {
+			call.CallID = newResponsesID("call")
+		}
+		toolCalls = append(toolCalls, map[string]any{
+			"id":   call.CallID,
+			"type": "function",
+			"function": map[string]any{
+				"name":      call.Name,
+				"arguments": call.Arguments,
+			},
+		})
+	}
+	payload := map[string]any{
+		"id":      "chatcmpl-" + uuid.NewString(),
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   modelID,
+		"choices": []map[string]any{
+			{
+				"index": 0,
+				"message": map[string]any{
+					"role":       "assistant",
+					"content":    nil,
+					"tool_calls": toolCalls,
+				},
+				"finish_reason": "tool_calls",
+			},
+		},
+		"usage": map[string]any{
+			"prompt_tokens":     usage.PromptTokens,
+			"completion_tokens": usage.CompletionTokens,
+			"total_tokens":      usage.TotalTokens,
+			"estimated":         usage.Estimated,
+		},
+		"notion_trace": trace,
+	}
+	return payload
+}
+
 func (s *OpenAIService) Response(ctx context.Context, body map[string]any, opts ...OpenAIRequestOptions) (CompletionResult, error) {
 	options := mergeOpenAIRequestOptions(opts...)
 	raw, _ := json.Marshal(body)
@@ -221,15 +325,27 @@ func (s *OpenAIService) Response(ctx context.Context, body map[string]any, opts 
 		return CompletionResult{}, err
 	}
 	threadID := firstNonEmpty(stringFromAny(body["thread_id"]), stringFromAny(body["thread"]), stringFromAny(body["notion_thread_id"]), stringFromMetadata(body["metadata"], "thread_id", "notion_thread_id"))
+	if result, ok := maybeBuildCodexCompactionResult(row.PublicID, body); ok {
+		slog.Info("responses completed local codex compaction",
+			"request_id", options.RequestID,
+			"model", result.Model,
+			"response_id", stringFromAny(result.Payload["id"]),
+			"answer_preview", truncateRunes(collapseWhitespace(result.Text), 180),
+		)
+		return result, nil
+	}
 	if result, ok := maybeBuildCodexFileToolCallResult(row.PublicID, body); ok {
+		s.bindLocalResponseToExistingSticky(ctx, body, options, result)
 		logCodexToolCallConversion(options, result)
 		return result, nil
 	}
 	if result, ok := maybeBuildCodexDeterministicEditToolCallResult(row.PublicID, body); ok {
+		s.bindLocalResponseToExistingSticky(ctx, body, options, result)
 		logCodexToolCallConversion(options, result)
 		return result, nil
 	}
 	if result, ok := maybeBuildCodexApplyPatchCompletionResult(row.PublicID, body); ok {
+		s.bindLocalResponseToExistingSticky(ctx, body, options, result)
 		slog.Info("responses completed local apply_patch output",
 			"request_id", options.RequestID,
 			"model", result.Model,
@@ -303,10 +419,8 @@ func (s *OpenAIService) Response(ctx context.Context, body map[string]any, opts 
 		"request":        notionResult.Payload,
 	}
 	if toolResult, ok := maybeBuildCodexAssistantTextToolCallResult(row.PublicID, body, answer, trace); ok {
-		if responseStoreEnabled(body) {
-			if responseID := stringFromAny(toolResult.Payload["id"]); responseID != "" {
-				s.bindStickyThread(ctx, account, notionResult, sessionKeys, responseID, options.APIKeyID)
-			}
+		if responseID := stringFromAny(toolResult.Payload["id"]); responseID != "" {
+			s.bindStickyThread(ctx, account, notionResult, sessionKeys, responseID, options.APIKeyID)
 		}
 		logCodexToolCallConversion(options, toolResult)
 		return toolResult, nil
@@ -317,9 +431,7 @@ func (s *OpenAIService) Response(ctx context.Context, body map[string]any, opts 
 		usage.CompletionTokens = completionTokens
 		usage.TotalTokens = usage.PromptTokens + completionTokens
 	}
-	if responseStoreEnabled(body) {
-		s.bindStickyThread(ctx, account, notionResult, sessionKeys, responseID, options.APIKeyID)
-	}
+	s.bindStickyThread(ctx, account, notionResult, sessionKeys, responseID, options.APIKeyID)
 	payload := buildResponsesPayload(row.PublicID, answer, usage, responseID, newResponsesID("msg"), createdAt, body, trace)
 	if incompleteDetails != nil {
 		payload["status"] = "incomplete"
@@ -458,6 +570,110 @@ func (s *OpenAIService) bindStickyThread(ctx context.Context, account model.Acco
 	}
 }
 
+func (s *OpenAIService) bindLocalResponseToExistingSticky(ctx context.Context, body map[string]any, opts OpenAIRequestOptions, result CompletionResult) {
+	if s.sticky == nil || result.Payload == nil {
+		return
+	}
+	binding, ok := s.existingStickyBinding(ctx, body, opts)
+	if !ok || strings.TrimSpace(binding.ThreadID) == "" || binding.AccountID == 0 {
+		return
+	}
+	keys := []stickySessionKey{
+		{Key: responseStickyKey(opts.APIKeyID, stringFromAny(result.Payload["id"])), Source: "local_response_id"},
+	}
+	for _, callID := range responseOutputCallIDs(result.Payload["output"]) {
+		keys = append(keys, stickySessionKey{Key: responseStickyKey(opts.APIKeyID, callID), Source: "local_tool_call_id"})
+	}
+	keys = appendUniqueStickyKeys(keys)
+	for _, key := range keys {
+		if key.Key == "" {
+			continue
+		}
+		next := binding
+		next.StickyKey = key.Key
+		if err := s.sticky.Set(ctx, next, stickyTTL(s.cfg.Sticky)); err != nil {
+			slog.Warn("sticky session bind failed", "sticky_source", key.Source, "account_id", binding.AccountID, "error", err)
+		}
+	}
+}
+
+func (s *OpenAIService) bindLocalChatResponseToExistingSticky(ctx context.Context, req dto.ChatCompletionRequest, opts OpenAIRequestOptions, result CompletionResult) {
+	if s.sticky == nil || result.Payload == nil {
+		return
+	}
+	binding, ok := s.existingChatStickyBinding(ctx, req, opts)
+	if !ok || strings.TrimSpace(binding.ThreadID) == "" || binding.AccountID == 0 {
+		return
+	}
+	keys := []stickySessionKey{
+		chatCompletionResponseKey(opts.APIKeyID, stringFromAny(result.Payload["id"])),
+	}
+	for _, callID := range chatCompletionResponseToolCallIDs(result.Payload) {
+		keys = append(keys, chatCompletionResponseKey(opts.APIKeyID, callID))
+	}
+	keys = appendUniqueStickyKeys(keys)
+	for _, key := range keys {
+		if key.Key == "" {
+			continue
+		}
+		next := binding
+		next.StickyKey = key.Key
+		if err := s.sticky.Set(ctx, next, stickyTTL(s.cfg.Sticky)); err != nil {
+			slog.Warn("sticky session bind failed", "sticky_source", key.Source, "account_id", binding.AccountID, "error", err)
+		}
+	}
+}
+
+func (s *OpenAIService) existingStickyBinding(ctx context.Context, body map[string]any, opts OpenAIRequestOptions) (StickyThreadBinding, bool) {
+	if s.sticky == nil {
+		return StickyThreadBinding{}, false
+	}
+	keys := []stickySessionKey{}
+	if threadID := firstNonEmpty(stringFromAny(body["thread_id"]), stringFromAny(body["thread"]), stringFromAny(body["notion_thread_id"]), stringFromMetadata(body["metadata"], "thread_id", "notion_thread_id")); threadID != "" {
+		keys = append(keys, stickySessionKey{Key: threadID, Source: "thread_id"})
+	}
+	keys = appendUniqueStickyKeys(keys, responseStickySessionKeys(body, opts))
+	for _, key := range keys {
+		if key.Key == "" {
+			continue
+		}
+		binding, ok, err := s.sticky.Get(ctx, key.Key)
+		if err != nil {
+			slog.Warn("sticky session lookup failed", "sticky_source", key.Source, "error", err)
+			continue
+		}
+		if ok && strings.TrimSpace(binding.ThreadID) != "" && binding.AccountID != 0 {
+			return binding, true
+		}
+	}
+	return StickyThreadBinding{}, false
+}
+
+func (s *OpenAIService) existingChatStickyBinding(ctx context.Context, req dto.ChatCompletionRequest, opts OpenAIRequestOptions) (StickyThreadBinding, bool) {
+	if s.sticky == nil {
+		return StickyThreadBinding{}, false
+	}
+	keys := []stickySessionKey{}
+	if threadID := firstNonEmpty(req.ThreadID, req.Thread, req.NotionThreadID, stringFromMetadata(req.Metadata, "thread_id", "notion_thread_id")); threadID != "" {
+		keys = append(keys, stickySessionKey{Key: threadID, Source: "thread_id"})
+	}
+	keys = appendUniqueStickyKeys(keys, chatStickySessionKeys(req, opts))
+	for _, key := range keys {
+		if key.Key == "" {
+			continue
+		}
+		binding, ok, err := s.sticky.Get(ctx, key.Key)
+		if err != nil {
+			slog.Warn("sticky session lookup failed", "sticky_source", key.Source, "error", err)
+			continue
+		}
+		if ok && strings.TrimSpace(binding.ThreadID) != "" && binding.AccountID != 0 {
+			return binding, true
+		}
+	}
+	return StickyThreadBinding{}, false
+}
+
 func (s *OpenAIService) clearStickyThreadBindings(ctx context.Context, threadID string, sessionKeys []stickySessionKey) {
 	if s.sticky == nil {
 		return
@@ -498,7 +714,7 @@ func logCodexToolCallConversion(opts OpenAIRequestOptions, result CompletionResu
 	if toolCall == nil {
 		return
 	}
-	slog.Info("responses converted to codex tool call",
+	slog.Info("openai converted to codex tool call",
 		"request_id", opts.RequestID,
 		"model", result.Model,
 		"response_id", stringFromAny(result.Payload["id"]),
@@ -511,7 +727,7 @@ func logCodexToolCallConversion(opts OpenAIRequestOptions, result CompletionResu
 }
 
 func chatStickySessionKeys(req dto.ChatCompletionRequest, opts OpenAIRequestOptions) []stickySessionKey {
-	return appendUniqueStickyKeys([]stickySessionKey{
+	keys := appendUniqueStickyKeys([]stickySessionKey{
 		clientStickyKey(opts.APIKeyID, "header_session_id", opts.HeaderSessionID),
 		clientStickyKey(opts.APIKeyID, "header_conversation_id", opts.HeaderConversationID),
 		clientStickyKey(opts.APIKeyID, "prompt_cache_key", req.PromptCacheKey),
@@ -520,11 +736,80 @@ func chatStickySessionKeys(req dto.ChatCompletionRequest, opts OpenAIRequestOpti
 		clientStickyKey(opts.APIKeyID, "metadata_conversation_id", stringFromMetadata(req.Metadata, "conversation_id", "notion_conversation_id")),
 		clientStickyKey(opts.APIKeyID, "user", req.User),
 	})
+	keys = append(keys, chatHistoryContinuationStickyKey(req, opts))
+	keys = append(keys, chatFirstUserStickyKey(req, opts))
+	for _, callID := range chatToolOutputCallIDs(req.Messages) {
+		keys = append(keys, chatCompletionResponseKey(opts.APIKeyID, callID))
+	}
+	return appendUniqueStickyKeys(keys)
+}
+
+func chatCompletionAnswerStickyKeys(req dto.ChatCompletionRequest, answer string, opts OpenAIRequestOptions) []stickySessionKey {
+	if strings.TrimSpace(answer) == "" {
+		return nil
+	}
+	messages := append([]dto.ChatMessage{}, req.Messages...)
+	messages = append(messages, dto.ChatMessage{Role: "assistant", Content: answer})
+	return []stickySessionKey{chatHistoryStickyKey(opts.APIKeyID, req.Model, messages, "chat_history")}
+}
+
+func chatHistoryContinuationStickyKey(req dto.ChatCompletionRequest, opts OpenAIRequestOptions) stickySessionKey {
+	idx := chatCurrentTurnStart(req.Messages)
+	if idx <= 0 {
+		return stickySessionKey{}
+	}
+	return chatHistoryStickyKey(opts.APIKeyID, req.Model, req.Messages[:idx], "chat_history")
+}
+
+func chatFirstUserStickyKey(req dto.ChatCompletionRequest, opts OpenAIRequestOptions) stickySessionKey {
+	for _, message := range req.Messages {
+		if strings.EqualFold(strings.TrimSpace(message.Role), "user") {
+			text := strings.TrimSpace(contentToText(message.Content))
+			if text == "" {
+				return stickySessionKey{}
+			}
+			return hashedClientStickyKey(opts.APIKeyID, "chat_first_user", req.Model+"\n"+text)
+		}
+	}
+	return stickySessionKey{}
+}
+
+func chatHistoryStickyKey(apiKeyID uint, model string, messages []dto.ChatMessage, source string) stickySessionKey {
+	if len(messages) == 0 {
+		return stickySessionKey{}
+	}
+	parts := make([]string, 0, len(messages)*2+1)
+	parts = append(parts, "model:"+strings.TrimSpace(model))
+	for _, message := range messages {
+		role := strings.ToLower(strings.TrimSpace(message.Role))
+		if role == "" {
+			role = "user"
+		}
+		text := strings.TrimSpace(chatMessageContentToText(message))
+		if text == "" {
+			continue
+		}
+		parts = append(parts, role+":"+text)
+	}
+	if len(parts) <= 1 {
+		return stickySessionKey{}
+	}
+	return hashedClientStickyKey(apiKeyID, source, strings.Join(parts, "\n"))
+}
+
+func hashedClientStickyKey(apiKeyID uint, source string, value string) stickySessionKey {
+	source = strings.TrimSpace(source)
+	value = strings.TrimSpace(value)
+	if source == "" || value == "" {
+		return stickySessionKey{}
+	}
+	sum := sha256.Sum256([]byte(value))
+	return clientStickyKey(apiKeyID, source, hex.EncodeToString(sum[:]))
 }
 
 func responseStickySessionKeys(body map[string]any, opts OpenAIRequestOptions) []stickySessionKey {
 	metadata := body["metadata"]
-	return appendUniqueStickyKeys([]stickySessionKey{
+	keys := appendUniqueStickyKeys([]stickySessionKey{
 		{Key: responseStickyKey(opts.APIKeyID, stringFromAny(body["previous_response_id"])), Source: "previous_response_id"},
 		clientStickyKey(opts.APIKeyID, "header_session_id", opts.HeaderSessionID),
 		clientStickyKey(opts.APIKeyID, "header_conversation_id", opts.HeaderConversationID),
@@ -534,6 +819,10 @@ func responseStickySessionKeys(body map[string]any, opts OpenAIRequestOptions) [
 		clientStickyKey(opts.APIKeyID, "metadata_conversation_id", stringFromMetadata(metadata, "conversation_id", "notion_conversation_id")),
 		clientStickyKey(opts.APIKeyID, "user", stringFromAny(body["user"])),
 	})
+	for _, callID := range responseToolOutputCallIDs(body["input"]) {
+		keys = append(keys, stickySessionKey{Key: responseStickyKey(opts.APIKeyID, callID), Source: "tool_call_id"})
+	}
+	return appendUniqueStickyKeys(keys)
 }
 
 func clientStickyKey(apiKeyID uint, source string, value string) stickySessionKey {
@@ -556,6 +845,14 @@ func responseStickyKey(apiKeyID uint, responseID string) string {
 	return fmt.Sprintf("response:k%d:%s", apiKeyID, responseID)
 }
 
+func chatCompletionResponseKey(apiKeyID uint, id string) stickySessionKey {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return stickySessionKey{}
+	}
+	return stickySessionKey{Key: fmt.Sprintf("chat:k%d:%s", apiKeyID, id), Source: "chat_response_id"}
+}
+
 func appendUniqueStickyKeys(groups ...[]stickySessionKey) []stickySessionKey {
 	seen := map[string]struct{}{}
 	keys := []stickySessionKey{}
@@ -572,6 +869,31 @@ func appendUniqueStickyKeys(groups ...[]stickySessionKey) []stickySessionKey {
 		}
 	}
 	return keys
+}
+
+func chatToolOutputCallIDs(messages []dto.ChatMessage) []string {
+	ids := []string{}
+	for _, message := range messages {
+		if callID := strings.TrimSpace(message.ToolCallID); callID != "" {
+			ids = append(ids, callID)
+		}
+	}
+	return ids
+}
+
+func chatCompletionResponseToolCallIDs(payload map[string]any) []string {
+	ids := []string{}
+	for _, rawChoice := range sliceFromAny(payload["choices"]) {
+		choice := mapFromAny(rawChoice)
+		message := mapFromAny(choice["message"])
+		for _, rawCall := range sliceFromAny(message["tool_calls"]) {
+			call := mapFromAny(rawCall)
+			if callID := stringFromAny(call["id"]); callID != "" {
+				ids = append(ids, callID)
+			}
+		}
+	}
+	return ids
 }
 
 func (s *OpenAIService) runPromptWithHealth(ctx context.Context, account model.Account, req NotionPromptRequest) (model.Account, NotionRunResult, error) {
@@ -613,7 +935,7 @@ func normalizeChatMessages(messages []dto.ChatMessage) (string, string, []hidden
 		if role == "" {
 			role = "user"
 		}
-		content := contentToText(message.Content)
+		content := chatMessageContentToText(message)
 		if role == "system" || role == "developer" {
 			if content != "" {
 				hiddenParts = append(hiddenParts, formatPromptSection(role, content))
@@ -625,10 +947,138 @@ func normalizeChatMessages(messages []dto.ChatMessage) (string, string, []hidden
 			b.WriteString(role)
 			b.WriteString(": ")
 		}
+		if role == "tool" {
+			b.WriteString("\n")
+		}
 		b.WriteString(content)
 		b.WriteString("\n")
 	}
 	return strings.TrimSpace(b.String()), strings.TrimSpace(strings.Join(hiddenParts, "\n\n")), hiddenMessages
+}
+
+func chatMessageContentToText(message dto.ChatMessage) string {
+	role := strings.ToLower(strings.TrimSpace(message.Role))
+	content := contentToText(message.Content)
+	if role == "tool" || strings.TrimSpace(message.ToolCallID) != "" {
+		item := map[string]any{
+			"role":    "tool",
+			"call_id": message.ToolCallID,
+			"name":    message.Name,
+			"output":  content,
+		}
+		return formatResponsesToolOutputForPrompt(item)
+	}
+	parts := []string{}
+	if content != "" {
+		parts = append(parts, content)
+	}
+	if toolCalls := formatChatToolCallsForPrompt(message.ToolCalls); toolCalls != "" {
+		parts = append(parts, toolCalls)
+	}
+	if functionCall := formatChatFunctionCallForPrompt(message.FunctionCall); functionCall != "" {
+		parts = append(parts, functionCall)
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func formatChatToolCallsForPrompt(toolCalls any) string {
+	items := sliceFromAny(toolCalls)
+	if len(items) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(items))
+	for _, raw := range items {
+		item := mapFromAny(raw)
+		if item == nil {
+			continue
+		}
+		callID := firstNonEmpty(stringFromAny(item["id"]), stringFromAny(item["call_id"]))
+		function := mapFromAny(item["function"])
+		name := firstNonEmpty(stringFromAny(item["name"]), stringFromAny(function["name"]))
+		arguments := firstNonEmpty(stringFromAny(item["arguments"]), stringFromAny(function["arguments"]))
+		parts = append(parts, formatResponsesToolCallForPrompt(map[string]any{
+			"type":      "function_call",
+			"call_id":   callID,
+			"name":      name,
+			"arguments": arguments,
+		}))
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func formatChatFunctionCallForPrompt(functionCall any) string {
+	call := mapFromAny(functionCall)
+	if call == nil {
+		return ""
+	}
+	return formatResponsesToolCallForPrompt(map[string]any{
+		"type":      "function_call",
+		"name":      stringFromAny(call["name"]),
+		"arguments": stringFromAny(call["arguments"]),
+	})
+}
+
+func normalizeChatMessagesForNotion(messages []dto.ChatMessage, continuingThread bool) (string, string, []hiddenPromptMessage) {
+	if !continuingThread {
+		return normalizeChatMessages(messages)
+	}
+	_, hiddenPrompt, hiddenMessages := normalizeChatMessages(messages)
+	start := chatCurrentTurnStart(messages)
+	if start < 0 || start >= len(messages) {
+		return "", hiddenPrompt, hiddenMessages
+	}
+	prompt, _, _ := normalizeChatMessages(messages[start:])
+	return prompt, hiddenPrompt, hiddenMessages
+}
+
+func chatCurrentTurnStart(messages []dto.ChatMessage) int {
+	for idx := len(messages) - 1; idx >= 0; idx-- {
+		if strings.EqualFold(strings.TrimSpace(messages[idx].Role), "user") && strings.TrimSpace(contentToText(messages[idx].Content)) != "" {
+			return idx
+		}
+	}
+	for idx := len(messages) - 1; idx >= 0; idx-- {
+		role := strings.ToLower(strings.TrimSpace(messages[idx].Role))
+		if role != "system" && role != "developer" {
+			return idx
+		}
+	}
+	return -1
+}
+
+func codexFileRefsFromChatMessages(messages []dto.ChatMessage) []string {
+	for idx := len(messages) - 1; idx >= 0; idx-- {
+		if !strings.EqualFold(strings.TrimSpace(messages[idx].Role), "user") {
+			continue
+		}
+		text := contentToText(messages[idx].Content)
+		if strings.TrimSpace(text) == "" || isCodexInternalUserText(text) {
+			continue
+		}
+		return uniqueCodexFileRefs(
+			codexFileRefsFromText(text),
+			codexFileRefsFromText(cleanResponsesCurrentUserText(text)),
+		)
+	}
+	return nil
+}
+
+func chatMessagesHaveToolOutput(messages []dto.ChatMessage) bool {
+	for _, message := range messages {
+		role := strings.ToLower(strings.TrimSpace(message.Role))
+		if role == "tool" || strings.TrimSpace(message.ToolCallID) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func isCodexChatTitleGenerationRequest(messages []dto.ChatMessage) bool {
+	if len(messages) == 0 {
+		return false
+	}
+	text := strings.ToLower(contentToText(messages[len(messages)-1].Content))
+	return strings.Contains(text, "generate a concise ui title") || strings.Contains(text, "short title for a task")
 }
 
 func contentToText(value any) string {
@@ -793,7 +1243,8 @@ func formatFileReferenceForPrompt(name string, ref string) string {
 }
 
 func responsesPromptPartsFromBody(body map[string]any) (string, string, []hiddenPromptMessage) {
-	prompt, inputHiddenPrompt, inputHiddenMessages := promptAndHiddenFromResponsesInput(body["input"])
+	visibleInput := responsesCurrentTaskInput(body["input"])
+	prompt, inputHiddenPrompt, inputHiddenMessages := promptAndHiddenFromResponsesInput(visibleInput)
 	if attachmentsPrompt := promptFromResponsesInput(body["attachments"]); attachmentsPrompt != "" {
 		prompt = joinPromptParts(prompt, attachmentsPrompt)
 	}
@@ -814,6 +1265,7 @@ func responsesPromptPartsFromBody(body map[string]any) (string, string, []hidden
 		}
 	}
 	prompt = normalizeRolePrefixesInPrompt(prompt)
+	prompt = appendResponsesCurrentUserRequest(prompt, body["input"])
 	prompt = applyResponsesInputTruncation(prompt, body)
 	hiddenPrompt = appendResponsesRequestControlInstructions(hiddenPrompt, body)
 	hiddenPrompt, hiddenMessages = appendResponseFormatInstruction(hiddenPrompt, hiddenMessages, body["response_format"])
@@ -823,6 +1275,246 @@ func responsesPromptPartsFromBody(body map[string]any) (string, string, []hidden
 func promptFromResponsesInput(input any) string {
 	prompt, _, _ := promptAndHiddenFromResponsesInput(input)
 	return prompt
+}
+
+func appendResponsesCurrentUserRequest(prompt string, input any) string {
+	users := responsesActionableUserMessageTextsFromInput(input)
+	if len(users) <= 1 {
+		return strings.TrimSpace(prompt)
+	}
+	current := cleanResponsesCurrentUserText(users[len(users)-1])
+	if current == "" {
+		return strings.TrimSpace(prompt)
+	}
+	section := formatPromptSection("current_user_request", "Treat this as the active request for this turn:\n"+current)
+	if strings.Contains(prompt, section) {
+		return strings.TrimSpace(prompt)
+	}
+	return joinPromptParts(prompt, section)
+}
+
+func responsesCurrentTaskInput(input any) any {
+	switch typed := input.(type) {
+	case string:
+		if isCodexInternalUserText(typed) {
+			return ""
+		}
+		return input
+	case []any:
+		return responsesCurrentTaskItems(typed)
+	case []map[string]any:
+		items := make([]any, 0, len(typed))
+		for _, item := range typed {
+			items = append(items, item)
+		}
+		return responsesCurrentTaskItems(items)
+	default:
+		return input
+	}
+}
+
+func responsesCurrentTaskItems(items []any) []any {
+	if len(items) == 0 {
+		return nil
+	}
+	actionableUsers := []int{}
+	for idx, item := range items {
+		text, ok := responsesTopLevelUserText(item)
+		if !ok || strings.TrimSpace(text) == "" || isCodexInternalUserText(text) {
+			continue
+		}
+		actionableUsers = append(actionableUsers, idx)
+	}
+	start := 0
+	latestActionableUser := -1
+	priorFileRefs := []string{}
+	if len(actionableUsers) > 0 {
+		latestActionableUser = actionableUsers[len(actionableUsers)-1]
+	}
+	if len(actionableUsers) > 1 {
+		priorActionableUser := actionableUsers[len(actionableUsers)-2]
+		start = priorActionableUser + 1
+		if text, ok := responsesTopLevelUserText(items[priorActionableUser]); ok {
+			priorFileRefs = uniqueCodexFileRefs(
+				codexFileRefsFromText(text),
+				codexFileRefsFromText(cleanResponsesCurrentUserText(text)),
+			)
+		}
+	}
+	out := make([]any, 0, len(items)-start)
+	if len(priorFileRefs) > 0 {
+		out = append(out, responsesPriorFileRefsInputItem(priorFileRefs))
+	}
+	for idx, item := range items[start:] {
+		absoluteIdx := start + idx
+		text, ok := responsesTopLevelUserText(item)
+		if ok && isCodexInternalUserText(text) {
+			continue
+		}
+		if latestActionableUser >= 0 && absoluteIdx < latestActionableUser && !responsesInputItemCarriesToolContext(item) {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func responsesPriorFileRefsInputItem(files []string) map[string]any {
+	lines := make([]string, 0, len(files))
+	for _, file := range files {
+		file = strings.TrimSpace(file)
+		if file == "" {
+			continue
+		}
+		lines = append(lines, "- ["+file+"]("+file+")")
+	}
+	return map[string]any{
+		"type": "message",
+		"role": "user",
+		"content": []any{
+			map[string]any{
+				"type": "input_text",
+				"text": "Relevant file refs from previous turn:\n" + strings.Join(lines, "\n"),
+			},
+		},
+	}
+}
+
+func responsesInputItemCarriesToolContext(input any) bool {
+	item := mapFromAny(input)
+	if item == nil {
+		return false
+	}
+	role := strings.ToLower(strings.TrimSpace(stringFromAny(item["role"])))
+	itemType := strings.ToLower(strings.TrimSpace(stringFromAny(item["type"])))
+	return role == "tool" ||
+		itemType == "function_call" ||
+		itemType == "custom_tool_call" ||
+		itemType == "function_call_output" ||
+		itemType == "custom_tool_call_output" ||
+		itemType == "tool_result"
+}
+
+func responsesTopLevelUserText(input any) (string, bool) {
+	switch typed := input.(type) {
+	case string:
+		return typed, strings.TrimSpace(typed) != ""
+	default:
+		item := mapFromAny(input)
+		if item == nil {
+			return "", false
+		}
+		itemType := strings.ToLower(strings.TrimSpace(stringFromAny(item["type"])))
+		role := strings.ToLower(strings.TrimSpace(stringFromAny(item["role"])))
+		if role == "" && itemType == "message" {
+			role = "user"
+		}
+		if role != "user" {
+			return "", false
+		}
+		return contentToText(item["content"]), true
+	}
+}
+
+func responsesActionableUserMessageTextsFromInput(input any) []string {
+	raw := responsesUserMessageTextsFromInput(input)
+	out := make([]string, 0, len(raw))
+	for _, text := range raw {
+		text = strings.TrimSpace(text)
+		if text == "" || isCodexInternalUserText(text) {
+			continue
+		}
+		out = append(out, text)
+	}
+	return out
+}
+
+func responsesUserMessageTextsFromInput(input any) []string {
+	out := []string{}
+	var walk func(any)
+	walk = func(value any) {
+		switch typed := value.(type) {
+		case string:
+			if text := strings.TrimSpace(typed); text != "" {
+				out = append(out, text)
+			}
+		case []any:
+			for _, item := range typed {
+				walk(item)
+			}
+		case []map[string]any:
+			for _, item := range typed {
+				walk(item)
+			}
+		case map[string]any:
+			itemType := strings.ToLower(strings.TrimSpace(stringFromAny(typed["type"])))
+			role := strings.ToLower(strings.TrimSpace(stringFromAny(typed["role"])))
+			if role == "" && itemType == "message" {
+				role = "user"
+			}
+			if role == "user" {
+				if text := strings.TrimSpace(contentToText(typed["content"])); text != "" {
+					out = append(out, text)
+				}
+				return
+			}
+			if itemType == "input_text" {
+				return
+			}
+			if content, ok := typed["content"]; ok {
+				walk(content)
+			}
+		}
+	}
+	walk(input)
+	return out
+}
+
+func cleanResponsesCurrentUserText(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	if isCodexInternalUserText(text) {
+		return ""
+	}
+	text = responsesEnvContextPattern.ReplaceAllString(text, "")
+	text = codexToolResultBlockPattern.ReplaceAllString(text, "")
+	text = codexContextResultBlockPattern.ReplaceAllString(text, "")
+	text = responsesToolCallPattern.ReplaceAllString(text, "")
+	text = normalizeRolePrefixesInPrompt(text)
+	const maxRunes = 4000
+	if utf8.RuneCountInString(text) > maxRunes {
+		text = truncateRunes(text, maxRunes) + "\n[truncated]"
+	}
+	return formatRolePromptLine("user", text)
+}
+
+func isCodexInternalUserText(text string) bool {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return false
+	}
+	lower := strings.ToLower(text)
+	if strings.Contains(lower, "you are performing a copoint compaction") ||
+		strings.Contains(lower, "create a handoff summary for another llm") ||
+		strings.Contains(lower, "another language model started to solve this problem") {
+		return true
+	}
+	if strings.Contains(lower, "handoff summary") {
+		for _, marker := range []string{
+			"current progress",
+			"what remains to be done",
+			"当前进展",
+			"接下来要做什么",
+			"已做决策",
+		} {
+			if strings.Contains(lower, marker) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func responsesNotionVisiblePrompt(prompt string, hiddenMessageGroups ...[]hiddenPromptMessage) string {
@@ -881,7 +1573,7 @@ func responsesSanitizedVisibleInstructionContent(role string, text string) strin
 	}
 	lower := strings.ToLower(text)
 	if strings.Contains(lower, "you are codex") || strings.Contains(lower, "apply_patch") || strings.Contains(lower, "exec_command") || strings.Contains(lower, "custom_tool_call") {
-		return "The upstream client provided " + role + " instructions. Follow the user-facing task and requested output format. For file edits, provide a concrete patch/diff instead of saying local file writing is unavailable."
+		return "The upstream client provided Codex-compatible " + role + " instructions. Follow the user-facing task and requested output format. For file edits, provide a concrete patch/diff instead of saying local file writing is unavailable."
 	}
 	return ""
 }
@@ -1409,6 +2101,33 @@ func responseToolOutputCallIDs(input any) []string {
 	}
 }
 
+func responseOutputCallIDs(output any) []string {
+	switch typed := output.(type) {
+	case []any:
+		out := []string{}
+		for _, item := range typed {
+			out = append(out, responseOutputCallIDs(item)...)
+		}
+		return out
+	case []map[string]any:
+		out := []string{}
+		for _, item := range typed {
+			out = append(out, responseOutputCallIDs(item)...)
+		}
+		return out
+	case map[string]any:
+		itemType := strings.ToLower(strings.TrimSpace(stringFromAny(typed["type"])))
+		if itemType == "function_call" || itemType == "custom_tool_call" {
+			if callID := stringFromAny(typed["call_id"]); callID != "" {
+				return []string{callID}
+			}
+		}
+		return responseOutputCallIDs(typed["content"])
+	default:
+		return nil
+	}
+}
+
 func cleanupPendingResponseContexts(now time.Time) {
 	pendingResponseContexts.Range(func(key any, value any) bool {
 		ctx, ok := value.(pendingResponseContext)
@@ -1419,8 +2138,124 @@ func cleanupPendingResponseContexts(now time.Time) {
 	})
 }
 
+func maybeBuildCodexCompactionResult(modelID string, body map[string]any) (CompletionResult, bool) {
+	if body == nil || !isCodexCompactionRequest(body["input"]) || isCodexTitleGenerationRequest(body) {
+		return CompletionResult{}, false
+	}
+	answer := codexCompactionSummaryFromBody(body)
+	usagePrompt := legacyPromptFromResponsesInput(body["input"])
+	promptTokens := security.EstimateTokens(usagePrompt)
+	completionTokens := security.EstimateTokens(answer)
+	usage := dto.UsageDTO{
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+		TotalTokens:      promptTokens + completionTokens,
+		Estimated:        true,
+	}
+	trace := map[string]any{
+		"converted_only": true,
+		"local_reason":   "codex_compaction",
+	}
+	payload := buildResponsesPayload(modelID, answer, usage, newResponsesID("resp"), newResponsesID("msg"), time.Now().Unix(), body, trace)
+	return CompletionResult{Payload: payload, Usage: usage, Model: modelID, Text: answer, Trace: trace}, true
+}
+
+func isCodexCompactionRequest(input any) bool {
+	for _, text := range responsesUserMessageTextsFromInput(input) {
+		lower := strings.ToLower(strings.TrimSpace(text))
+		if strings.Contains(lower, "you are performing a copoint compaction") ||
+			strings.Contains(lower, "create a handoff summary for another llm") {
+			return true
+		}
+	}
+	return false
+}
+
+func codexCompactionSummaryFromBody(body map[string]any) string {
+	users := responsesActionableUserMessageTextsFromInput(body["input"])
+	active := ""
+	if len(users) > 0 {
+		active = strings.TrimSpace(cleanResponsesCurrentUserText(users[len(users)-1]))
+		active = strings.TrimSpace(strings.TrimPrefix(active, "user:"))
+	}
+	var b strings.Builder
+	b.WriteString("## Handoff Summary\n\n")
+	b.WriteString("### 当前进展 / 已做决策\n")
+	b.WriteString("- 已由 notion2api 本地处理 Codex 上下文压缩请求；不要把压缩指令发送到 Notion 会话。\n")
+	b.WriteString("- 历史 assistant 回复和已完成的 tool 输出只作为背景，不应被当作新的待办重新执行。\n")
+	if active != "" {
+		b.WriteString("- 当前真实用户请求是：")
+		b.WriteString(active)
+		b.WriteString("\n")
+	}
+	if outputs := responsesRecentToolOutputSummaries(body["input"], 3); len(outputs) > 0 {
+		b.WriteString("\n### 可用工具结果\n")
+		for _, output := range outputs {
+			b.WriteString("- ")
+			b.WriteString(output)
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("\n### 接下来要做什么\n")
+	if active != "" {
+		b.WriteString("1. 继续处理当前真实用户请求：")
+		b.WriteString(active)
+		b.WriteString("\n")
+	} else {
+		b.WriteString("1. 等待下一条真实用户请求；不要根据压缩上下文本身启动新任务。\n")
+	}
+	b.WriteString("2. 如果上下文里出现已完成的文件读取、补丁或解释，不要重复执行，除非最新用户请求明确要求重新执行。\n")
+	return b.String()
+}
+
+func responsesRecentToolOutputSummaries(input any, limit int) []string {
+	if limit <= 0 {
+		return nil
+	}
+	outputs := []string{}
+	var walk func(any)
+	walk = func(value any) {
+		switch typed := value.(type) {
+		case []any:
+			for _, item := range typed {
+				walk(item)
+			}
+		case []map[string]any:
+			for _, item := range typed {
+				walk(item)
+			}
+		case map[string]any:
+			itemType := strings.ToLower(strings.TrimSpace(stringFromAny(typed["type"])))
+			role := strings.ToLower(strings.TrimSpace(stringFromAny(typed["role"])))
+			if role == "tool" || itemType == "function_call_output" || itemType == "custom_tool_call_output" || itemType == "tool_result" {
+				if text := responsesToolOutputText(firstNonEmptyAny(typed["output"], typed["content"])); text != "" {
+					outputs = append(outputs, truncateRunes(collapseWhitespace(text), 220))
+				}
+				return
+			}
+			if content, ok := typed["content"]; ok {
+				walk(content)
+			}
+		}
+	}
+	walk(input)
+	if len(outputs) <= limit {
+		return outputs
+	}
+	return outputs[len(outputs)-limit:]
+}
+
+func firstNonEmptyAny(values ...any) any {
+	for _, value := range values {
+		if strings.TrimSpace(contentToText(value)) != "" {
+			return value
+		}
+	}
+	return nil
+}
+
 func maybeBuildCodexFileToolCallResult(modelID string, body map[string]any) (CompletionResult, bool) {
-	if body == nil || responsesInputHasToolOutput(body["input"]) || isCodexTitleGenerationRequest(body) {
+	if body == nil || responsesInputHasBlockingToolOutputState(body["input"]) || isCodexTitleGenerationRequest(body) {
 		return CompletionResult{}, false
 	}
 	files := codexFileRefsFromResponsesBody(body)
@@ -1437,7 +2272,7 @@ func maybeBuildCodexAssistantTextToolCallResult(modelID string, body map[string]
 	if result, ok := maybeBuildCodexApplyPatchToolCallResult(modelID, body, answer, baseTrace); ok {
 		return result, true
 	}
-	if responsesInputHasToolOutput(body["input"]) {
+	if responsesInputHasBlockingToolOutputState(body["input"]) {
 		return CompletionResult{}, false
 	}
 	if !codexAssistantTextLooksLikeFileToolCall(answer) {
@@ -1807,10 +2642,37 @@ func codexFileRefsFromResponsesBody(body map[string]any) []string {
 	if body == nil {
 		return nil
 	}
+	users := responsesActionableUserMessageTextsFromInput(body["input"])
+	if len(users) > 0 {
+		if files := codexFileRefsFromLatestUserTexts(users); len(files) > 0 {
+			return files
+		}
+		if len(users) > 1 || responsesInputHasToolOutput(body["input"]) {
+			return codexFileRefsFromResponsesInput(body["attachments"])
+		}
+	}
 	return uniqueCodexFileRefs(
 		codexFileRefsFromResponsesInput(body["input"]),
 		codexFileRefsFromResponsesInput(body["attachments"]),
 	)
+}
+
+func codexFileRefsFromLatestUserMessage(input any) []string {
+	return codexFileRefsFromLatestUserTexts(responsesActionableUserMessageTextsFromInput(input))
+}
+
+func codexFileRefsFromLatestUserTexts(users []string) []string {
+	for idx := len(users) - 1; idx >= 0; idx-- {
+		text := strings.TrimSpace(users[idx])
+		if text == "" {
+			continue
+		}
+		return uniqueCodexFileRefs(
+			codexFileRefsFromText(text),
+			codexFileRefsFromText(cleanResponsesCurrentUserText(text)),
+		)
+	}
+	return nil
 }
 
 func shellQuote(value string) string {
@@ -2405,7 +3267,36 @@ func codexLooksLikePlainFileRef(file string) bool {
 	if strings.HasPrefix(base, ".") {
 		return false
 	}
-	return strings.Contains(base, ".")
+	allDigitsDots := true
+	hasDot := false
+	for _, r := range base {
+		if r == '.' {
+			hasDot = true
+			continue
+		}
+		if r < '0' || r > '9' {
+			allDigitsDots = false
+			break
+		}
+	}
+	if allDigitsDots && hasDot {
+		return false
+	}
+	dot := strings.LastIndex(base, ".")
+	if dot <= 0 || dot == len(base)-1 {
+		return false
+	}
+	ext := base[dot+1:]
+	if len(ext) > 16 {
+		return false
+	}
+	for _, r := range ext {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func uniqueCodexFileRefs(groups ...[]string) []string {
@@ -2535,6 +3426,10 @@ func responsesInputHasBlockingApplyPatchToolState(input any) bool {
 	return responsesInputHasApplyPatchToolOutput(input) && !responsesInputHasUserMessageAfterCustomToolCallOutput(input)
 }
 
+func responsesInputHasBlockingToolOutputState(input any) bool {
+	return responsesInputHasToolOutput(input) && !responsesInputHasUserMessageAfterToolOutput(input)
+}
+
 func responsesInputHasApplyPatchToolCall(input any) bool {
 	switch typed := input.(type) {
 	case []any:
@@ -2563,6 +3458,21 @@ func responsesInputHasApplyPatchToolCall(input any) bool {
 }
 
 func responsesInputHasUserMessageAfterCustomToolCallOutput(input any) bool {
+	return responsesInputHasUserMessageAfterOutput(input, func(item map[string]any) bool {
+		itemType := strings.ToLower(strings.TrimSpace(stringFromAny(item["type"])))
+		return itemType == "custom_tool_call_output"
+	})
+}
+
+func responsesInputHasUserMessageAfterToolOutput(input any) bool {
+	return responsesInputHasUserMessageAfterOutput(input, func(item map[string]any) bool {
+		itemType := strings.ToLower(strings.TrimSpace(stringFromAny(item["type"])))
+		role := strings.ToLower(strings.TrimSpace(stringFromAny(item["role"])))
+		return role == "tool" || itemType == "function_call_output" || itemType == "custom_tool_call_output" || itemType == "tool_result"
+	})
+}
+
+func responsesInputHasUserMessageAfterOutput(input any, isOutput func(map[string]any) bool) bool {
 	seenOutput := false
 	foundUser := false
 	var walk func(any)
@@ -2586,9 +3496,8 @@ func responsesInputHasUserMessageAfterCustomToolCallOutput(input any) bool {
 				}
 			}
 		case map[string]any:
-			itemType := strings.ToLower(strings.TrimSpace(stringFromAny(typed["type"])))
 			role := strings.ToLower(strings.TrimSpace(stringFromAny(typed["role"])))
-			if itemType == "custom_tool_call_output" {
+			if isOutput != nil && isOutput(typed) {
 				seenOutput = true
 			}
 			if seenOutput && role == "user" && strings.TrimSpace(contentToText(typed["content"])) != "" {

@@ -398,6 +398,7 @@ func (g *NotionGateway) DeleteThread(ctx context.Context, account model.Account,
 
 func (g *NotionGateway) BuildPayload(account model.Account, req NotionPromptRequest) (map[string]any, string) {
 	threadID := strings.TrimSpace(req.UpstreamThreadID)
+	continuingThread := threadID != ""
 	if threadID == "" {
 		threadID = uuid.NewString()
 	}
@@ -493,9 +494,12 @@ func (g *NotionGateway) BuildPayload(account model.Account, req NotionPromptRequ
 		contextValue["instructions"] = hiddenPrompt
 		contextValue["runtimePromptHint"] = hiddenPrompt
 	}
-	transcript := []map[string]any{
-		{"id": configID, "type": "config", "value": configValue},
-		{"id": contextID, "type": "context", "value": contextValue},
+	transcript := []map[string]any{}
+	if !continuingThread {
+		transcript = append(transcript,
+			map[string]any{"id": configID, "type": "config", "value": configValue},
+			map[string]any{"id": contextID, "type": "context", "value": contextValue},
+		)
 	}
 	transcript = append(transcript, map[string]any{
 		"id":        userStepID,
@@ -507,14 +511,14 @@ func (g *NotionGateway) BuildPayload(account model.Account, req NotionPromptRequ
 	payload := map[string]any{
 		"spaceId":                       account.SpaceID,
 		"threadId":                      threadID,
-		"createThread":                  strings.TrimSpace(req.UpstreamThreadID) == "",
-		"generateTitle":                 strings.TrimSpace(req.UpstreamThreadID) == "",
+		"createThread":                  !continuingThread,
+		"generateTitle":                 !continuingThread,
 		"traceId":                       uuid.NewString(),
 		"transcript":                    transcript,
 		"threadType":                    threadType,
 		"asPatchResponse":               true,
-		"isPartialTranscript":           false,
-		"saveAllThreadOperations":       strings.TrimSpace(req.UpstreamThreadID) == "",
+		"isPartialTranscript":           continuingThread,
+		"saveAllThreadOperations":       !continuingThread,
 		"setUnreadState":                true,
 		"createdSource":                 surface,
 		"isUserInAnySalesAssistedSpace": false,
