@@ -12,7 +12,7 @@ security:
 
 database:
   driver: sqlite
-  dsn: /app/data/notaion2api.sqlite
+  dsn: /app/data/notion2api.sqlite
   max_idle_conns: 5
   max_open_conns: 20
   conn_max_lifetime_seconds: 3600

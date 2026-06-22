@@ -17,8 +17,8 @@ import (
 	"time"
 	"unicode"
 
-	"notaion2api/backend/internal/dto"
-	"notaion2api/backend/internal/model"
+	"notion2api/backend/internal/dto"
+	"notion2api/backend/internal/model"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"

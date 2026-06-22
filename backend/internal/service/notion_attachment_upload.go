@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"notaion2api/backend/internal/model"
+	"notion2api/backend/internal/model"
 
 	"github.com/google/uuid"
 )

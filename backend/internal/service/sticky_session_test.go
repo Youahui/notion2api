@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"notaion2api/backend/internal/config"
-	"notaion2api/backend/internal/model"
-	"notaion2api/backend/internal/repository"
+	"notion2api/backend/internal/config"
+	"notion2api/backend/internal/model"
+	"notion2api/backend/internal/repository"
 )
 
 func TestNewStickySessionStoreDefaultsToLocalCache(t *testing.T) {

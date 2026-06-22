@@ -5,9 +5,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"notaion2api/backend/internal/config"
-	"notaion2api/backend/internal/dto"
-	"notaion2api/backend/internal/repository"
+	"notion2api/backend/internal/config"
+	"notion2api/backend/internal/dto"
+	"notion2api/backend/internal/repository"
 )
 
 func TestLogsHydratesAPIKeyDisplayFields(t *testing.T) {

@@ -20,7 +20,7 @@ export function LoginPage() {
     <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', background: '#f6f8fb', padding: 24 }}>
       <Card style={{ width: 380 }}>
         <Typography.Title level={3} style={{ marginTop: 0 }}>
-          notaion2api
+          notion2api
         </Typography.Title>
         <Form
           layout="vertical"

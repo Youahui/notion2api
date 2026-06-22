@@ -1,18 +1,20 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
-	"notaion2api/backend/internal/dto"
-	"notaion2api/backend/internal/pkg/requestctx"
-	"notaion2api/backend/internal/pkg/respond"
-	"notaion2api/backend/internal/service"
+	"notion2api/backend/internal/dto"
+	"notion2api/backend/internal/pkg/requestctx"
+	"notion2api/backend/internal/pkg/respond"
+	"notion2api/backend/internal/service"
 
 	"github.com/gin-gonic/gin"
 )
@@ -75,16 +77,42 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 	apiKey, _ := requestctx.APIKey(c)
+	if stream, _ := body["stream"].(bool); stream {
+		streamWriter := newLiveResponsesStreamWriter(c)
+		result, streamed, err := h.openai.ResponseStream(c.Request.Context(), body, streamWriter.Start, streamWriter.Delta, openAIRequestOptions(c, apiKey.ID))
+		if err != nil {
+			if streamed || streamWriter.Started() {
+				streamWriter.Error(err)
+				return
+			}
+			handleOpenAIError(c, err)
+			return
+		}
+		if streamed || streamWriter.Started() {
+			streamWriter.Finish(result)
+		} else {
+			h.streamResponse(c, result)
+		}
+		_ = h.keys.RecordUsage(c.Request.Context(), service.UsageRecord{
+			APIKeyID:         apiKey.ID,
+			Method:           c.Request.Method,
+			Route:            "/v1/responses",
+			StatusCode:       http.StatusOK,
+			LatencyMs:        time.Since(start).Milliseconds(),
+			Model:            result.Model,
+			PromptTokens:     result.Usage.PromptTokens,
+			CompletionTokens: result.Usage.CompletionTokens,
+			TotalTokens:      result.Usage.TotalTokens,
+			Estimated:        result.Usage.Estimated,
+		})
+		return
+	}
 	result, err := h.openai.Response(c.Request.Context(), body, openAIRequestOptions(c, apiKey.ID))
 	if err != nil {
 		handleOpenAIError(c, err)
 		return
 	}
-	if stream, _ := body["stream"].(bool); stream {
-		h.streamResponse(c, result)
-	} else {
-		c.JSON(http.StatusOK, result.Payload)
-	}
+	c.JSON(http.StatusOK, result.Payload)
 	_ = h.keys.RecordUsage(c.Request.Context(), service.UsageRecord{
 		APIKeyID:         apiKey.ID,
 		Method:           c.Request.Method,
@@ -100,7 +128,42 @@ func (h *Handler) Responses(c *gin.Context) {
 }
 
 func (h *Handler) ResponseByID(c *gin.Context) {
-	c.JSON(http.StatusNotImplemented, service.OpenAIError("response store lookup is not implemented yet", "invalid_request_error", "not_implemented"))
+	apiKey, _ := requestctx.APIKey(c)
+	payload, err := h.openai.ResponseByID(c.Request.Context(), c.Param("id"), openAIRequestOptions(c, apiKey.ID))
+	if err != nil {
+		handleResponseStoreError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, payload)
+}
+
+func (h *Handler) ResponseDelete(c *gin.Context) {
+	apiKey, _ := requestctx.APIKey(c)
+	payload, err := h.openai.DeleteResponse(c.Request.Context(), c.Param("id"), openAIRequestOptions(c, apiKey.ID))
+	if err != nil {
+		handleResponseStoreError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, payload)
+}
+
+func (h *Handler) ResponseInputItems(c *gin.Context) {
+	apiKey, _ := requestctx.APIKey(c)
+	limit := 0
+	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			c.JSON(http.StatusBadRequest, service.OpenAIError("invalid limit", "invalid_request_error", "invalid_limit"))
+			return
+		}
+		limit = parsed
+	}
+	payload, err := h.openai.ResponseInputItems(c.Request.Context(), c.Param("id"), limit, c.Query("after"), openAIRequestOptions(c, apiKey.ID))
+	if err != nil {
+		handleResponseStoreError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, payload)
 }
 
 func openAIRequestOptions(c *gin.Context, apiKeyID uint) service.OpenAIRequestOptions {
@@ -119,6 +182,17 @@ func firstOpenAIHeader(c *gin.Context, names ...string) string {
 		}
 	}
 	return ""
+}
+
+func handleResponseStoreError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, service.ErrNotFound):
+		c.JSON(http.StatusNotFound, service.OpenAIError("response not found", "invalid_request_error", "response_not_found"))
+	case errors.Is(err, service.ErrInvalid):
+		c.JSON(http.StatusBadRequest, service.OpenAIError("invalid response id", "invalid_request_error", "invalid_response_id"))
+	default:
+		handleOpenAIError(c, err)
+	}
 }
 
 func (h *Handler) AdminModels(c *gin.Context) {
@@ -210,6 +284,213 @@ func handlerSliceFromAny(value any) []any {
 		return out
 	default:
 		return nil
+	}
+}
+
+type liveResponsesStreamWriter struct {
+	c              *gin.Context
+	requestID      string
+	responseID     string
+	outputItemID   string
+	model          string
+	createdAt      int64
+	sequenceNumber int
+	started        bool
+	text           strings.Builder
+}
+
+func newLiveResponsesStreamWriter(c *gin.Context) *liveResponsesStreamWriter {
+	return &liveResponsesStreamWriter{
+		c:         c,
+		requestID: c.GetString("request_id"),
+	}
+}
+
+func (w *liveResponsesStreamWriter) Started() bool {
+	return w != nil && w.started
+}
+
+func (w *liveResponsesStreamWriter) Start(start service.ResponseStreamStart) error {
+	if w == nil || w.c == nil {
+		return nil
+	}
+	if w.c.Request != nil {
+		if err := w.c.Request.Context().Err(); err != nil {
+			return err
+		}
+	}
+	w.responseID = strings.TrimSpace(start.ResponseID)
+	w.outputItemID = strings.TrimSpace(start.OutputItemID)
+	w.model = strings.TrimSpace(start.Model)
+	w.createdAt = start.CreatedAt
+	w.started = true
+	w.c.Header("Content-Type", "text/event-stream")
+	w.c.Header("Cache-Control", "no-cache")
+	w.c.Header("Connection", "keep-alive")
+	w.c.Header("X-Accel-Buffering", "no")
+	w.c.Status(http.StatusOK)
+
+	inProgressResponse := w.inProgressResponseObject()
+	inProgressItem := responseMessageItem(w.outputItemID, "", "in_progress")
+	w.writeEvent("response.created", map[string]any{"response": inProgressResponse})
+	w.writeEvent("response.in_progress", map[string]any{"response": inProgressResponse})
+	w.writeEvent("response.output_item.added", map[string]any{
+		"response_id":  w.responseID,
+		"output_index": 0,
+		"item":         inProgressItem,
+	})
+	w.writeEvent("response.content_part.added", map[string]any{
+		"response_id":   w.responseID,
+		"output_index":  0,
+		"item_id":       w.outputItemID,
+		"content_index": 0,
+		"part":          responseOutputTextPart(""),
+	})
+	return nil
+}
+
+func (w *liveResponsesStreamWriter) Delta(delta string) error {
+	if w == nil || w.c == nil || delta == "" {
+		return nil
+	}
+	if w.c.Request != nil {
+		if err := w.c.Request.Context().Err(); err != nil {
+			return err
+		}
+	}
+	if !w.started {
+		return nil
+	}
+	w.text.WriteString(delta)
+	w.writeEvent("response.output_text.delta", map[string]any{
+		"response_id":   w.responseID,
+		"output_index":  0,
+		"item_id":       w.outputItemID,
+		"content_index": 0,
+		"delta":         delta,
+	})
+	return nil
+}
+
+func (w *liveResponsesStreamWriter) Finish(result service.CompletionResult) {
+	if w == nil || w.c == nil || !w.started {
+		return
+	}
+	finalText := result.Text
+	if finalText == "" {
+		finalText = responseStringField(result.Payload, "output_text")
+	}
+	if delta := liveResponseMissingDelta(w.text.String(), finalText); delta != "" {
+		_ = w.Delta(delta)
+	}
+	completedItem := responseMessageItem(w.outputItemID, finalText, "completed")
+	w.writeEvent("response.output_text.done", map[string]any{
+		"response_id":   w.responseID,
+		"output_index":  0,
+		"item_id":       w.outputItemID,
+		"content_index": 0,
+		"text":          finalText,
+	})
+	w.writeEvent("response.content_part.done", map[string]any{
+		"response_id":   w.responseID,
+		"output_index":  0,
+		"item_id":       w.outputItemID,
+		"content_index": 0,
+		"part":          responseOutputTextPart(finalText),
+	})
+	w.writeEvent("response.output_item.done", map[string]any{
+		"response_id":  w.responseID,
+		"output_index": 0,
+		"item":         completedItem,
+	})
+	w.writeEvent(responseFinalStreamEvent(result.Payload), map[string]any{
+		"response": result.Payload,
+	})
+	slog.Info("responses live sse send done",
+		"request_id", w.requestID,
+		"response_id", w.responseID,
+		"events", w.sequenceNumber,
+	)
+	writeSSEDone(w.c.Writer)
+}
+
+func (w *liveResponsesStreamWriter) Error(err error) {
+	if w == nil || w.c == nil || !w.started {
+		return
+	}
+	w.writeEvent("error", map[string]any{
+		"error": openAIStreamError(err),
+	})
+	writeSSEDone(w.c.Writer)
+}
+
+func (w *liveResponsesStreamWriter) inProgressResponseObject() map[string]any {
+	return map[string]any{
+		"id":                 w.responseID,
+		"object":             "response",
+		"created_at":         w.createdAt,
+		"status":             "in_progress",
+		"model":              w.model,
+		"output":             []any{},
+		"output_text":        "",
+		"completed_at":       nil,
+		"error":              nil,
+		"incomplete_details": nil,
+		"usage":              nil,
+	}
+}
+
+func (w *liveResponsesStreamWriter) writeEvent(event string, payload map[string]any) {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	eventSequence := w.sequenceNumber
+	payload["type"] = event
+	payload["sequence_number"] = eventSequence
+	w.sequenceNumber++
+	encoded, _ := json.Marshal(payload)
+	logResponsesSSESendEvent(w.requestID, w.responseID, event, eventSequence, payload, encoded)
+	writeSSE(w.c.Writer, event, encoded)
+}
+
+func liveResponseMissingDelta(current string, final string) string {
+	if final == "" || final == current {
+		return ""
+	}
+	if current == "" {
+		return final
+	}
+	if strings.HasPrefix(final, current) {
+		return final[len(current):]
+	}
+	return ""
+}
+
+func openAIStreamError(err error) map[string]any {
+	if err == nil {
+		return map[string]any{
+			"message": "stream failed",
+			"type":    "api_error",
+			"code":    "stream_error",
+		}
+	}
+	var notionAPIError *service.NotionAPIError
+	var noAssistantTextError *service.NotionNoAssistantTextError
+	var inferenceStepError *service.NotionInferenceStepError
+	switch {
+	case errors.As(err, &notionAPIError):
+		return service.OpenAIError(notionAPIError.Error(), "api_error", "notion_upstream_error")["error"].(map[string]any)
+	case errors.As(err, &inferenceStepError):
+		if strings.EqualFold(strings.TrimSpace(inferenceStepError.SubType), "premium-feature-unavailable") {
+			return service.OpenAIError(inferenceStepError.Error(), "rate_limit_error", "premium_feature_unavailable")["error"].(map[string]any)
+		}
+		return service.OpenAIError(inferenceStepError.Error(), "api_error", "notion_inference_error")["error"].(map[string]any)
+	case errors.As(err, &noAssistantTextError):
+		return service.OpenAIError(noAssistantTextError.Error(), "api_error", "notion_no_assistant_text")["error"].(map[string]any)
+	case errors.Is(err, context.Canceled):
+		return service.OpenAIError("client canceled the stream", "api_error", "client_canceled")["error"].(map[string]any)
+	default:
+		return service.OpenAIError(err.Error(), "api_error", "stream_error")["error"].(map[string]any)
 	}
 }
 
@@ -331,8 +612,15 @@ func (h *Handler) streamResponseToolCalls(c *gin.Context, result service.Complet
 		outputItemID := responseStringField(item, "id")
 		if outputItemID == "" {
 			prefix := "fc_"
-			if itemType == "custom_tool_call" {
+			switch itemType {
+			case "custom_tool_call":
 				prefix = "ctc_"
+			case "shell_call":
+				prefix = "sh_"
+			case "local_shell_call":
+				prefix = "lsh_"
+			case "apply_patch_call":
+				prefix = "apc_"
 			}
 			outputItemID = prefix + strings.TrimPrefix(strings.ReplaceAll(responseID, "-", ""), "resp_")
 			if len(items) > 1 {
@@ -463,7 +751,7 @@ func responseOutputItemsAreToolCalls(items []map[string]any) bool {
 	}
 	for _, item := range items {
 		switch responseStringField(item, "type") {
-		case "function_call", "custom_tool_call":
+		case "function_call", "custom_tool_call", "shell_call", "local_shell_call", "apply_patch_call":
 		default:
 			return false
 		}

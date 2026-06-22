@@ -3,10 +3,10 @@ package router
 import (
 	"net/http"
 
-	"notaion2api/backend/internal/config"
-	"notaion2api/backend/internal/handler"
-	"notaion2api/backend/internal/middleware"
-	"notaion2api/backend/internal/service"
+	"notion2api/backend/internal/config"
+	"notion2api/backend/internal/handler"
+	"notion2api/backend/internal/middleware"
+	"notion2api/backend/internal/service"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -31,7 +31,7 @@ func New(cfg config.Config, admins *service.AdminService, keys *service.APIKeySe
 
 	r.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
-			"service": "notaion2api",
+			"service": "notion2api",
 			"admin":   "/admin",
 			"api":     "/v1",
 			"health":  "/healthz",
@@ -111,6 +111,8 @@ func New(cfg config.Config, admins *service.AdminService, keys *service.APIKeySe
 		v1.POST("/chat/completions", h.ChatCompletions)
 		v1.POST("/responses", h.Responses)
 		v1.GET("/responses/:id", h.ResponseByID)
+		v1.DELETE("/responses/:id", h.ResponseDelete)
+		v1.GET("/responses/:id/input_items", h.ResponseInputItems)
 	}
 
 	return r

@@ -29,7 +29,7 @@ export function AdminLayout() {
     <Layout style={{ minHeight: '100vh' }}>
       <Sider width={232}>
         <div style={{ height: 56, display: 'flex', alignItems: 'center', padding: '0 20px', color: '#fff', fontWeight: 700 }}>
-          notaion2api
+          notion2api
         </div>
         <Menu
           theme="dark"

@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"notaion2api/backend/internal/dto"
+	"notion2api/backend/internal/dto"
 
 	"github.com/google/uuid"
 )

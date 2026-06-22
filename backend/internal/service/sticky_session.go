@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"notaion2api/backend/internal/config"
+	"notion2api/backend/internal/config"
 )
 
 type StickyThreadBinding struct {

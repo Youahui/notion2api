@@ -6,9 +6,9 @@ import (
 	"strings"
 	"time"
 
-	"notaion2api/backend/internal/dto"
-	"notaion2api/backend/internal/model"
-	"notaion2api/backend/internal/repository"
+	"notion2api/backend/internal/dto"
+	"notion2api/backend/internal/model"
+	"notion2api/backend/internal/repository"
 
 	"gorm.io/gorm"
 )
@@ -89,7 +89,7 @@ func ModelDTO(row model.Model) dto.ModelDTO {
 		ID:          row.PublicID,
 		Object:      "model",
 		Created:     row.CreatedAt.Unix(),
-		OwnedBy:     "notaion2api",
+		OwnedBy:     "notion2api",
 		Name:        row.Name,
 		Family:      row.Family,
 		Group:       row.Group,

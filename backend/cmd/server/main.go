@@ -8,7 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"notaion2api/backend/internal/bootstrap"
+	"notion2api/backend/internal/bootstrap"
 )
 
 func main() {

@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"notaion2api/backend/internal/config"
-	"notaion2api/backend/internal/model"
+	"notion2api/backend/internal/config"
+	"notion2api/backend/internal/model"
 
 	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
@@ -30,7 +30,7 @@ func OpenDatabase(cfg config.DatabaseConfig) (*Store, error) {
 	case "sqlite":
 		dsn := cfg.DSN
 		if dsn == "" {
-			dsn = "data/notaion2api.sqlite"
+			dsn = "data/notion2api.sqlite"
 		}
 		if err := ensureSQLiteDir(dsn); err != nil {
 			return nil, err

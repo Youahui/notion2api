@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: notaion2api-backend
+    container_name: notion2api-backend
     restart: unless-stopped
     ports:
       - "${N2A_PORT:-9991}:9998"
@@ -17,7 +17,7 @@ services:
       N2A_BOOTSTRAP_ADMIN_USERNAME: ${N2A_BOOTSTRAP_ADMIN_USERNAME:-}
       N2A_BOOTSTRAP_ADMIN_PASSWORD: ${N2A_BOOTSTRAP_ADMIN_PASSWORD:-}
       N2A_BOOTSTRAP_API_KEY: ${N2A_BOOTSTRAP_API_KEY:-}
-    command: ["./notaion2api", "--config", "/app/config/config.yaml"]
+    command: ["./notion2api", "--config", "/app/config/config.yaml"]
 
   frontend:
     build:
@@ -25,7 +25,7 @@ services:
       dockerfile: frontend/Dockerfile
       args:
         VITE_API_BASE_URL: ${N2A_FRONTEND_API_BASE_URL:-/api}
-    container_name: notaion2api-frontend
+    container_name: notion2api-frontend
     restart: unless-stopped
     depends_on:
       - backend
@@ -39,8 +39,8 @@ services:
     profiles: ["postgres"]
     restart: unless-stopped
     environment:
-      POSTGRES_DB: notaion2api
-      POSTGRES_USER: notaion2api
+      POSTGRES_DB: notion2api
+      POSTGRES_USER: notion2api
       POSTGRES_PASSWORD: change-me
     volumes:
       - pg-data:/var/lib/postgresql/data

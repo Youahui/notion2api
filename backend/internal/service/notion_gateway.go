@@ -17,10 +17,10 @@ import (
 	"strings"
 	"time"
 
-	"notaion2api/backend/internal/config"
-	"notaion2api/backend/internal/dto"
-	"notaion2api/backend/internal/model"
-	proxyclient "notaion2api/backend/internal/proxy"
+	"notion2api/backend/internal/config"
+	"notion2api/backend/internal/dto"
+	"notion2api/backend/internal/model"
+	proxyclient "notion2api/backend/internal/proxy"
 
 	enetxg "github.com/enetx/g"
 	"github.com/enetx/surf"
@@ -61,6 +61,8 @@ type notionTextStreamResult struct {
 	RawResponse string
 	Completed   bool
 }
+
+type notionTextDeltaFunc func(delta string) error
 
 type notionFinalAnswerResult struct {
 	Text      string
@@ -541,6 +543,14 @@ func (g *NotionGateway) BuildPayload(account model.Account, req NotionPromptRequ
 }
 
 func (g *NotionGateway) RunPrompt(ctx context.Context, account model.Account, req NotionPromptRequest) (NotionRunResult, error) {
+	return g.runPrompt(ctx, account, req, nil)
+}
+
+func (g *NotionGateway) RunPromptStream(ctx context.Context, account model.Account, req NotionPromptRequest, onTextDelta notionTextDeltaFunc) (NotionRunResult, error) {
+	return g.runPrompt(ctx, account, req, onTextDelta)
+}
+
+func (g *NotionGateway) runPrompt(ctx context.Context, account model.Account, req NotionPromptRequest, onTextDelta notionTextDeltaFunc) (NotionRunResult, error) {
 	payload, threadID := g.BuildPayload(account, req)
 	if strings.TrimSpace(account.AuthToken) == "" && strings.TrimSpace(account.Cookie) == "" {
 		return NotionRunResult{
@@ -584,7 +594,7 @@ func (g *NotionGateway) RunPrompt(ctx context.Context, account model.Account, re
 		}
 		return NotionRunResult{ThreadID: threadID, Payload: payload, RawResponse: string(raw)}, &NotionAPIError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(raw))}
 	}
-	streamResult, err := consumeNotionTextStream(resp.Body, threadID, notionIdleAfterAnswerTimeout, req.RequestID)
+	streamResult, err := consumeNotionTextStream(resp.Body, threadID, notionIdleAfterAnswerTimeout, req.RequestID, onTextDelta)
 	text, messageID, rawResponse := streamResult.Text, streamResult.MessageID, streamResult.RawResponse
 	if err != nil {
 		return NotionRunResult{ThreadID: threadID, Payload: payload, RawResponse: rawResponse}, err
@@ -1209,7 +1219,7 @@ type notionStreamReadEvent struct {
 	err  error
 }
 
-func consumeNotionTextStream(reader io.ReadCloser, threadID string, idleAfterAnswer time.Duration, requestID string) (notionTextStreamResult, error) {
+func consumeNotionTextStream(reader io.ReadCloser, threadID string, idleAfterAnswer time.Duration, requestID string, onTextDelta ...notionTextDeltaFunc) (notionTextStreamResult, error) {
 	state := &notionTranscriptState{ActiveAgentIndex: -1}
 	events := make(chan notionStreamReadEvent, 1)
 	done := make(chan struct{})
@@ -1251,6 +1261,10 @@ func consumeNotionTextStream(reader io.ReadCloser, threadID string, idleAfterAns
 	var bestText string
 	var messageID string
 	lineNumber := 0
+	var deltaHandler notionTextDeltaFunc
+	if len(onTextDelta) > 0 {
+		deltaHandler = onTextDelta[0]
+	}
 	var idleTimer *time.Timer
 	var idleC <-chan time.Time
 	defer func() {
@@ -1339,6 +1353,12 @@ func consumeNotionTextStream(reader io.ReadCloser, threadID string, idleAfterAns
 			text, id := state.handlePayload(payload, threadID)
 			if text = sanitizeNotionAssistantText(text); text != "" {
 				if shouldUseNotionStreamText(bestText, text) {
+					if delta := notionStreamTextDelta(bestText, text); delta != "" && deltaHandler != nil {
+						if err := deltaHandler(delta); err != nil {
+							logFinish("delta_callback_error", err)
+							return result(), err
+						}
+					}
 					bestText = text
 				}
 				resetIdle()
@@ -1356,6 +1376,21 @@ func consumeNotionTextStream(reader io.ReadCloser, threadID string, idleAfterAns
 			return result(), nil
 		}
 	}
+}
+
+func notionStreamTextDelta(current string, candidate string) string {
+	current = sanitizeNotionAssistantText(current)
+	candidate = sanitizeNotionAssistantText(candidate)
+	if candidate == "" || candidate == current {
+		return ""
+	}
+	if current == "" {
+		return candidate
+	}
+	if strings.HasPrefix(candidate, current) {
+		return candidate[len(current):]
+	}
+	return ""
 }
 
 func logNotionSSEReceiveEvent(requestID string, threadID string, lineNumber int, rawLine []byte, payload any, parsedText string, parsedMessageID string, bestText string, bestMessageID string, terminal bool, note string) {

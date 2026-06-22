@@ -8,10 +8,10 @@ import (
 	"net/http"
 	"time"
 
-	"notaion2api/backend/internal/config"
-	"notaion2api/backend/internal/repository"
-	"notaion2api/backend/internal/router"
-	"notaion2api/backend/internal/service"
+	"notion2api/backend/internal/config"
+	"notion2api/backend/internal/repository"
+	"notion2api/backend/internal/router"
+	"notion2api/backend/internal/service"
 )
 
 func Run(ctx context.Context, configPath string) error {
@@ -51,7 +51,7 @@ func Run(ctx context.Context, configPath string) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		slog.Info("notaion2api listening", "addr", addr, "database_driver", cfg.Database.Driver)
+		slog.Info("notion2api listening", "addr", addr, "database_driver", cfg.Database.Driver)
 		errCh <- server.ListenAndServe()
 	}()
 

@@ -5,9 +5,9 @@
 [![Database](https://img.shields.io/badge/Database-SQLite%20%7C%20PostgreSQL-336791)](https://www.postgresql.org/)
 [![API](https://img.shields.io/badge/API-OpenAI%20Compatible-111827)](#api-用法)
 
-Notion2API 是一个基于 Go 的 Notion AI OpenAI 兼容桥接服务。它把 Notion AI 的上游协议封装成常见的 `/v1/models`、`/v1/chat/completions`、`/v1/responses` 接口，并提供管理台用于维护 Notion 账号池、API Key、模型、请求日志和用量统计。
+Notion2API 是一个基于 Go 的 Notion AI OpenAI / Codex 兼容桥接服务。它把 Notion AI 的上游协议封装成常见的 `/v1/models`、`/v1/chat/completions`、`/v1/responses` 接口，并提供管理台用于维护 Notion 账号池、API Key、模型、请求日志和用量统计。
 
-项目定位是私有化部署的 API 网关：客户端继续按 OpenAI 兼容格式调用，本服务负责鉴权、账号调度、Notion 会话请求、响应格式转换和本地持久化。
+项目定位是私有化部署的 API 网关：客户端继续按 OpenAI 兼容格式调用，本服务负责鉴权、账号调度、Notion 会话请求、响应格式转换、Codex 工具协议适配和本地持久化。
 
 ## 目录
 
@@ -31,14 +31,15 @@ Notion2API 是一个基于 Go 的 Notion AI OpenAI 兼容桥接服务。它把 N
 
 - OpenAI 兼容接口：模型列表、Chat Completions、Responses。
 - 支持 `stream: true`，以 SSE 格式返回 OpenAI 风格的流式数据。
+- Codex Responses 兼容：支持文件引用、常用本地工具调用协议和工具名透传。
 - Notion 账号池管理：账号启停、激活账号、优先级、并发数、失败状态、账号测试。
-- Notion 登录辅助：支持邮箱验证码登录，也支持手工导入 Cookie / `token_v2`。
+- Notion 登录辅助：支持邮箱验证码登录，也支持手工导入 Cookie、`token_v2` 或探测结果 JSON。
 - API Key 管理：创建、启用、禁用、删除、过期时间、总额度和每日额度。
 - 用量与日志：按 API Key、模型、日期记录请求数、估算 token 和请求日志。
 - 会话能力：支持 Notion 线程 ID 透传、粘性会话绑定、远端 Notion 会话列表和详情查看。
 - 代理配置：支持关闭代理、环境变量代理、HTTP、HTTPS、SOCKS5，并可按账号覆盖。
 - 数据库存储：默认 SQLite，可通过配置切换 PostgreSQL。
-- 前后端分离管理台：Go + Gin + GORM 后端，React + Vite + Ant Design 前端。
+- 前后端分离管理台：Go + Gin + GORM 后端，React + Vite + Ant Design 前端，Docker Compose 可同时启动后端和管理台。
 
 ## 工作原理
 
@@ -48,7 +49,8 @@ flowchart LR
   API --> Auth["API Key 鉴权与额度检查"]
   Auth --> Dispatch["模型解析与 Notion 账号调度"]
   Dispatch --> Notion["Notion AI 上游接口"]
-  Notion --> Convert["响应解析与 OpenAI 格式转换"]
+  Notion --> Convert["响应解析与 OpenAI / Codex 格式转换"]
+  Convert --> Tools["Responses 工具协议适配"]
   Convert --> Client
 
   Admin["Web 管理台"] --> AdminAPI["/admin 管理接口"]
@@ -99,6 +101,7 @@ Docker Compose 默认同时启动后端和管理台前端：
 - 后端 API：宿主机 `9998` -> 容器 `9998`
 - 前端管理台：宿主机 `8080` -> Nginx 容器 `80`
 - 前端容器会把 `/api/*` 反向代理到后端 `backend:9998`
+- 默认使用 SQLite，并把运行数据持久化到挂载的数据目录。
 
 ```bash
 N2A_BOOTSTRAP_ADMIN_USERNAME=admin \
@@ -125,7 +128,7 @@ http://127.0.0.1:8080/admin
 docker compose --profile postgres up -d postgres
 
 N2A_DATABASE_DRIVER=postgres \
-N2A_DATABASE_DSN='host=postgres user=notaion2api password=change-me dbname=notaion2api port=5432 sslmode=disable TimeZone=Asia/Shanghai' \
+N2A_DATABASE_DSN='host=postgres user=notion2api password=change-me dbname=notion2api port=5432 sslmode=disable TimeZone=Asia/Shanghai' \
 docker compose up -d --build backend
 ```
 
@@ -153,7 +156,7 @@ docker compose up -d --build backend
 | `GET` | `/v1/models/:id` | API Key | 查询单个模型。 |
 | `POST` | `/v1/chat/completions` | API Key | OpenAI Chat Completions。 |
 | `POST` | `/v1/responses` | API Key | OpenAI Responses。 |
-| `GET` | `/v1/responses/:id` | API Key | 响应查询接口；当前实现返回未实现错误。 |
+| `GET` | `/v1/responses/:id` | API Key | 响应查询接口；如未启用响应持久化，可能返回未实现或未找到。 |
 
 ### 管理接口
 
@@ -162,8 +165,8 @@ docker compose up -d --build backend
 | 登录 | `/admin/login`、`/admin/logout`、`/admin/verify` | 管理员登录、退出和 token 校验。 |
 | 管理员 | `/admin/admins` | 管理员列表、新增、更新和删除。 |
 | API Key | `/admin/api-keys` | API Key 创建、启停、删除、额度和单 Key 用量。 |
-| 账号 | `/admin/accounts` | Notion 账号新增、导入、登录、空间、激活和测试。 |
-| 模型 | `/admin/models` | 查看公开模型和 Notion 内部模型映射。 |
+| 账号 | `/admin/accounts` | Notion 账号新增、导入、登录、工作区/空间、激活、测试和代理配置。 |
+| 模型 | `/admin/models` | 查看公开模型、启停状态和 Notion 内部模型映射。 |
 | 会话 | `/admin/notion-conversations` | Notion 远端 AI 会话列表、详情和删除。 |
 | 用量日志 | `/admin/usage`、`/admin/logs` | token 估算用量和请求日志。 |
 
@@ -227,7 +230,13 @@ curl http://127.0.0.1:9998/v1/responses \
   }'
 ```
 
-Codex 原生 Responses 请求会在本地兼容 `@README.md` / `@path/file` 文件引用、`exec_command` 文件读取工具和 `apply_patch` 自定义工具；工具名带命名空间时也会按客户端声明名返回。
+### Codex Responses 兼容
+
+Codex 原生 Responses 请求会在本地兼容以下能力：
+
+- `@README.md` / `@path/file` 形式的文件引用。
+- `exec_command` 文件读取类工具调用。
+- `apply_patch` 自定义工具调用；工具名带命名空间时也会按客户端声明名返回，便于兼容不同客户端的工具声明方式。
 
 ### 兼容客户端配置
 
@@ -247,10 +256,12 @@ Codex 原生 Responses 请求会在本地兼容 `@README.md` / `@path/file` 文�
 | --- | --- |
 | `account_email` / `notion_account_email` | 指定使用某个 Notion 账号。 |
 | `thread_id` / `notion_thread_id` | 复用指定 Notion 线程；开启粘性会话后会绑定到同一账号。 |
-| `conversation_id` | 透传上游会话标识。 |
+| `conversation_id` | 透传或复用上游会话标识。 |
 | `use_web_search` | 覆盖配置中的 Web Search 开关。 |
 | `metadata.use_web_search` | 也可通过 metadata 控制 Web Search。 |
 | `response_format` | 会被转换为隐藏提示，约束输出格式。 |
+
+未被识别的 OpenAI 扩展字段通常会被忽略或透传到内部转换层；是否生效取决于当前上游 Notion AI 协议和模型能力。
 
 ## 管理台
 
@@ -290,7 +301,7 @@ security:
 
 database:
   driver: sqlite
-  dsn: data/notaion2api.sqlite
+  dsn: data/notion2api.sqlite
 
 upstream:
   base_url: https://www.notion.so
@@ -313,6 +324,7 @@ sticky:
 | `N2A_SERVER_HOST` / `N2A_SERVER_PORT` | 服务监听地址和端口。 |
 | `N2A_BOOTSTRAP_ADMIN_USERNAME` / `N2A_BOOTSTRAP_ADMIN_PASSWORD` | 首次初始化管理员。 |
 | `N2A_BOOTSTRAP_API_KEY` | 首次初始化 API Key；为空则不自动创建。 |
+| `N2A_ADMIN_TOKEN_TTL_HOURS` | 管理员登录 token 有效期。 |
 | `N2A_DATABASE_DRIVER` / `N2A_DATABASE_DSN` | 数据库类型和连接串。 |
 | `N2A_PROXY_MODE` / `N2A_PROXY_URL` | 全局上游代理。 |
 | `N2A_PROXY_HTTP_URL` / `N2A_PROXY_HTTPS_URL` | 分协议代理地址。 |
@@ -320,6 +332,7 @@ sticky:
 | `N2A_STICKY_REDIS_URL` | 可选 Redis 粘性会话存储。 |
 | `N2A_LOGIN_HELPER_SESSIONS_DIR` | Notion 登录会话文件目录。 |
 | `N2A_LOGIN_HELPER_TIMEOUT_SEC` | 邮箱验证码登录有效期。 |
+| `VITE_API_BASE_URL` | 前端开发服务访问后端 API 的基础地址。 |
 
 代理模式：
 
@@ -396,8 +409,8 @@ pnpm build
 
 ## 路线图
 
-- 完善 `/v1/responses/:id` 响应查询和 TTL 清理。
-- 将管理台静态构建产物纳入统一部署流程。
+- 完善 `/v1/responses/:id` 响应查询、响应持久化和 TTL 清理。
+- 持续增强 Codex Responses 工具协议兼容性。
 - 增强模型管理能力，支持后台启停和调整模型映射。
 - 补充更多账号调度、粘性会话和 Notion 网关测试。
 - 增加更细粒度的运行指标、错误审计和部署示例。

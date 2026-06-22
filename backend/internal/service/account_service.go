@@ -6,10 +6,10 @@ import (
 	"strings"
 	"time"
 
-	"notaion2api/backend/internal/config"
-	"notaion2api/backend/internal/dto"
-	"notaion2api/backend/internal/model"
-	"notaion2api/backend/internal/repository"
+	"notion2api/backend/internal/config"
+	"notion2api/backend/internal/dto"
+	"notion2api/backend/internal/model"
+	"notion2api/backend/internal/repository"
 
 	"gorm.io/gorm"
 )

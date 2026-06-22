@@ -1,7 +1,7 @@
 package requestctx
 
 import (
-	"notaion2api/backend/internal/model"
+	"notion2api/backend/internal/model"
 
 	"github.com/gin-gonic/gin"
 )

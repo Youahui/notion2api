@@ -6,9 +6,9 @@ import (
 	"strconv"
 	"strings"
 
-	"notaion2api/backend/internal/config"
-	"notaion2api/backend/internal/pkg/respond"
-	"notaion2api/backend/internal/service"
+	"notion2api/backend/internal/config"
+	"notion2api/backend/internal/pkg/respond"
+	"notion2api/backend/internal/service"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -41,7 +41,7 @@ func (h *Handler) Health(c *gin.Context) {
 	}
 	respond.JSON(c, http.StatusOK, gin.H{
 		"ok":              true,
-		"service":         "notaion2api",
+		"service":         "notion2api",
 		"database_driver": h.cfg.Database.Driver,
 	})
 }

@@ -6,9 +6,9 @@ import (
 	"strconv"
 	"strings"
 
-	"notaion2api/backend/internal/model"
-	"notaion2api/backend/internal/pkg/respond"
-	"notaion2api/backend/internal/service"
+	"notion2api/backend/internal/model"
+	"notion2api/backend/internal/pkg/respond"
+	"notion2api/backend/internal/service"
 
 	"github.com/gin-gonic/gin"
 )

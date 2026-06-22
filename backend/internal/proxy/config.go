@@ -7,8 +7,8 @@ import (
 	"os"
 	"strings"
 
-	"notaion2api/backend/internal/config"
-	"notaion2api/backend/internal/model"
+	"notion2api/backend/internal/config"
+	"notion2api/backend/internal/model"
 )
 
 const (

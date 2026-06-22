@@ -5,9 +5,9 @@ import (
 	"strings"
 	"testing"
 
-	"notaion2api/backend/internal/config"
-	"notaion2api/backend/internal/dto"
-	"notaion2api/backend/internal/model"
+	"notion2api/backend/internal/config"
+	"notion2api/backend/internal/dto"
+	"notion2api/backend/internal/model"
 )
 
 func TestNormalizeChatMessagesExtractsSystemAndDeveloper(t *testing.T) {

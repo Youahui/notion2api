@@ -5,8 +5,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"notaion2api/backend/internal/config"
-	"notaion2api/backend/internal/model"
+	"notion2api/backend/internal/config"
+	"notion2api/backend/internal/model"
 )
 
 func TestPolicyForAccountInheritsGlobalProxy(t *testing.T) {

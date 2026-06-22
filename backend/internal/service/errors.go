@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"notaion2api/backend/internal/config"
+	"notion2api/backend/internal/config"
 )
 
 var (

@@ -1,12 +1,15 @@
 package service
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
-	"notaion2api/backend/internal/dto"
+	"notion2api/backend/internal/config"
+	"notion2api/backend/internal/dto"
 )
 
 func TestPromptAndHiddenFromResponsesInputParsesMessageItems(t *testing.T) {
@@ -110,6 +113,28 @@ func TestResponsesPromptPartsFromBodyIncludesProtocolEnvelope(t *testing.T) {
 		if strings.Contains(hiddenPrompt, forbidden) {
 			t.Fatalf("hidden prompt should not expose raw protocol/tool data %q: %q", forbidden, hiddenPrompt)
 		}
+	}
+}
+
+func TestResponsesShouldLiveStreamTextPreservesApplyPatchToolCalls(t *testing.T) {
+	body := map[string]any{
+		"input": "修改 README.md",
+		"tools": []any{
+			map[string]any{"type": "custom", "name": "apply_patch"},
+		},
+	}
+	if responsesShouldLiveStreamText(body, "user: 修改 README.md") {
+		t.Fatal("edit requests with apply_patch available should preserve tool-call conversion instead of live text streaming")
+	}
+
+	body["input"] = "解释 README.md"
+	if !responsesShouldLiveStreamText(body, "user: 解释 README.md") {
+		t.Fatal("non-edit requests should still live stream text")
+	}
+
+	body["tool_choice"] = map[string]any{"type": "custom", "name": "apply_patch"}
+	if responsesShouldLiveStreamText(body, "user: 解释 README.md") {
+		t.Fatal("explicit apply_patch tool choice should preserve tool-call conversion")
 	}
 }
 
@@ -438,6 +463,83 @@ func TestMaybeBuildCodexFileToolCallResultUsesExecCommand(t *testing.T) {
 	}
 	if result.Payload["output_text"] != "" {
 		t.Fatalf("function call response should not include text output: %#v", result.Payload["output_text"])
+	}
+}
+
+func TestMaybeBuildCodexFileToolCallResultUsesNativeShellTool(t *testing.T) {
+	body := map[string]any{
+		"input": "帮我查看文件 [Dockerfile](Dockerfile)",
+		"tools": []any{
+			map[string]any{"type": "shell"},
+		},
+	}
+
+	result, ok := maybeBuildCodexFileToolCallResult("gpt-test", body)
+	if !ok {
+		t.Fatal("expected native shell tool to produce a shell_call")
+	}
+	output := result.Payload["output"].([]any)
+	item := output[0].(map[string]any)
+	defer pendingResponseContexts.Delete("resp:" + result.Payload["id"].(string))
+	defer pendingResponseContexts.Delete("call:" + item["call_id"].(string))
+	if item["type"] != "shell_call" {
+		t.Fatalf("expected shell_call item, got %#v", item)
+	}
+	action := item["action"].(map[string]any)
+	commands := stringsFromAny(action["commands"])
+	if len(commands) != 1 || !strings.Contains(commands[0], "Dockerfile") {
+		t.Fatalf("expected shell action to read Dockerfile, got %#v", action)
+	}
+	if result.Payload["output_text"] != "" {
+		t.Fatalf("shell call response should not include text output: %#v", result.Payload["output_text"])
+	}
+}
+
+func TestResponseToolChoiceAllowedToolsRestrictsLocalToolCalls(t *testing.T) {
+	body := map[string]any{
+		"input": "帮我查看文件 [Dockerfile](Dockerfile)",
+		"tools": []any{
+			map[string]any{"type": "shell"},
+			map[string]any{"type": "function", "name": "exec_command"},
+		},
+		"tool_choice": map[string]any{
+			"type": "allowed_tools",
+			"mode": "required",
+			"tools": []any{
+				map[string]any{"type": "apply_patch"},
+			},
+		},
+	}
+
+	if _, ok := maybeBuildCodexFileToolCallResult("gpt-test", body); ok {
+		t.Fatal("allowed_tools without shell/exec_command should block local file-read tool conversion")
+	}
+}
+
+func TestResponseToolChoiceAllowedToolsAllowsNativeShell(t *testing.T) {
+	body := map[string]any{
+		"input": "帮我查看文件 [Dockerfile](Dockerfile)",
+		"tools": []any{
+			map[string]any{"type": "shell"},
+		},
+		"tool_choice": map[string]any{
+			"type": "allowed_tools",
+			"mode": "required",
+			"tools": []any{
+				map[string]any{"type": "shell"},
+			},
+		},
+	}
+
+	result, ok := maybeBuildCodexFileToolCallResult("gpt-test", body)
+	if !ok {
+		t.Fatal("expected allowed native shell tool to produce a shell_call")
+	}
+	item := result.Payload["output"].([]any)[0].(map[string]any)
+	defer pendingResponseContexts.Delete("resp:" + result.Payload["id"].(string))
+	defer pendingResponseContexts.Delete("call:" + item["call_id"].(string))
+	if item["type"] != "shell_call" {
+		t.Fatalf("expected shell_call item, got %#v", item)
 	}
 }
 
@@ -903,6 +1005,37 @@ func TestMaybeBuildCodexAssistantTextToolCallResultConvertsNamespacedApplyPatch(
 	}
 }
 
+func TestMaybeBuildCodexAssistantTextToolCallResultConvertsNativeApplyPatch(t *testing.T) {
+	body := map[string]any{
+		"input": "帮我修改 [README.md](README.md)",
+		"tools": []any{
+			map[string]any{"type": "apply_patch"},
+		},
+		"tool_choice": map[string]any{"type": "apply_patch"},
+	}
+	answer := "*** Begin Patch\n*** Update File: README.md\n@@\n-old\n+new\n*** End Patch"
+
+	result, ok := maybeBuildCodexAssistantTextToolCallResult("gpt-test", body, answer, nil)
+	if !ok {
+		t.Fatal("expected native apply_patch text to be converted")
+	}
+	item := result.Payload["output"].([]any)[0].(map[string]any)
+	defer pendingResponseContexts.Delete("resp:" + result.Payload["id"].(string))
+	defer pendingResponseContexts.Delete("call:" + item["call_id"].(string))
+	if item["type"] != "custom_tool_call" || item["name"] != "apply_patch" {
+		t.Fatalf("expected native apply_patch to use Codex custom tool shape, got %#v", item)
+	}
+	input := item["input"].(string)
+	for _, want := range []string{"*** Begin Patch", "*** Update File: README.md", "@@\n", "-old", "+new", "*** End Patch"} {
+		if !strings.Contains(input, want) {
+			t.Fatalf("expected patch input to contain %q, got %q", want, input)
+		}
+	}
+	if !responsesInputHasApplyPatchToolCall([]any{item}) {
+		t.Fatalf("expected apply_patch custom call to be detected")
+	}
+}
+
 func TestMaybeBuildCodexDeterministicEditToolCallResultConvertsYamlPortChange(t *testing.T) {
 	body := map[string]any{
 		"input": []any{
@@ -1089,6 +1222,42 @@ func TestMaybeBuildCodexAssistantTextToolCallResultConvertsMarkdownInsertionBloc
 	}
 }
 
+func TestCodexUnifiedDiffToApplyPatchStopsBeforeTrailingMarkdownList(t *testing.T) {
+	answer := strings.Join([]string{
+		"下面是补丁：",
+		"```diff",
+		"diff --git a/README.md b/README.md",
+		"index 1111111..2222222 100644",
+		"--- a/README.md",
+		"+++ b/README.md",
+		"@@ -1,5 +1,5 @@",
+		" # Notion2API",
+		"-old line",
+		"+new line",
+		"",
+		"## 路线图",
+		"",
+		"- `backend/internal/router` 或注册路由相关文件",
+		"- `Dockerfile`",
+		"```",
+	}, "\n")
+
+	patch := codexApplyPatchFromAssistantText(answer)
+	if patch == "" {
+		t.Fatal("expected unified diff to be converted")
+	}
+	for _, want := range []string{"*** Begin Patch", "*** Update File: README.md", "@@\n", "-old line", "+new line", "*** End Patch"} {
+		if !strings.Contains(patch, want) {
+			t.Fatalf("expected converted patch to contain %q, got %q", want, patch)
+		}
+	}
+	for _, notWant := range []string{"backend/internal/router", "Dockerfile", "## 路线图"} {
+		if strings.Contains(patch, notWant) {
+			t.Fatalf("converted patch should not include trailing markdown %q, got %q", notWant, patch)
+		}
+	}
+}
+
 func TestMaybeBuildCodexAssistantTextToolCallResultSkipsAfterApplyPatchOutput(t *testing.T) {
 	body := map[string]any{
 		"input": []any{
@@ -1102,6 +1271,30 @@ func TestMaybeBuildCodexAssistantTextToolCallResultSkipsAfterApplyPatchOutput(t 
 
 	if _, ok := maybeBuildCodexAssistantTextToolCallResult("gpt-test", body, answer, nil); ok {
 		t.Fatal("apply_patch output follow-up should not produce another apply_patch call")
+	}
+}
+
+func TestMaybeBuildCodexAssistantTextToolCallResultRetriesAfterFailedApplyPatchOutput(t *testing.T) {
+	body := map[string]any{
+		"input": []any{
+			map[string]any{"type": "custom_tool_call", "call_id": "call_patch", "name": "apply_patch", "input": "*** Begin Patch\n*** End Patch\n"},
+			map[string]any{"type": "custom_tool_call_output", "call_id": "call_patch", "output": "apply_patch verification failed: Failed to find expected lines in README.md:\n-old"},
+		},
+		"tools": []any{
+			map[string]any{"type": "custom", "name": "apply_patch"},
+		},
+	}
+	answer := "*** Begin Patch\n*** Update File: README.md\n@@\n-old\n+new\n*** End Patch"
+
+	result, ok := maybeBuildCodexAssistantTextToolCallResult("gpt-test", body, answer, nil)
+	if !ok {
+		t.Fatal("failed apply_patch output should allow a corrected apply_patch retry")
+	}
+	item := result.Payload["output"].([]any)[0].(map[string]any)
+	defer pendingResponseContexts.Delete("resp:" + result.Payload["id"].(string))
+	defer pendingResponseContexts.Delete("call:" + item["call_id"].(string))
+	if item["type"] != "custom_tool_call" || item["name"] != "apply_patch" {
+		t.Fatalf("expected apply_patch retry tool call, got %#v", item)
 	}
 }
 
@@ -1141,6 +1334,71 @@ func TestMaybeBuildCodexApplyPatchCompletionResultSkipsNotionAfterSuccess(t *tes
 		t.Fatalf("local completion should not contain notion failure text: %#v", result.Payload["output_text"])
 	}
 	if !strings.Contains(result.Payload["output_text"].(string), "notion2api/backend/configs/config.docker.yaml") {
+		t.Fatalf("expected final text to include updated file, got %#v", result.Payload["output_text"])
+	}
+}
+
+func TestMaybeBuildCodexApplyPatchCompletionResultSkipsFailedToolOutput(t *testing.T) {
+	body := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type":    "custom_tool_call",
+				"call_id": "call_patch",
+				"name":    "apply_patch",
+				"input":   "*** Begin Patch\n*** Update File: README.md\n@@\n-old\n+new\n*** End Patch\n",
+			},
+			map[string]any{
+				"type":    "custom_tool_call_output",
+				"call_id": "call_patch",
+				"output":  "apply_patch verification failed: Failed to find expected lines in README.md:\n-old",
+			},
+		},
+		"tools": []any{
+			map[string]any{"type": "custom", "name": "apply_patch"},
+		},
+	}
+
+	if _, ok := maybeBuildCodexApplyPatchCompletionResult("gpt-test", body); ok {
+		t.Fatal("failed apply_patch output should go upstream for retry")
+	}
+}
+
+func TestCodexApplyPatchCompletionAnswerReportsFailure(t *testing.T) {
+	answer := codexApplyPatchCompletionAnswer("apply_patch verification failed: Failed to find expected lines in README.md")
+	if !strings.Contains(answer, "失败") {
+		t.Fatalf("expected failure answer, got %q", answer)
+	}
+}
+
+func TestMaybeBuildCodexApplyPatchCompletionResultHandlesNativeApplyPatchOutput(t *testing.T) {
+	body := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type":    "apply_patch_call",
+				"call_id": "call_patch",
+				"operation": map[string]any{
+					"type": "update_file",
+					"path": "README.md",
+					"diff": "@@\n-old\n+new\n",
+				},
+			},
+			map[string]any{
+				"type":    "apply_patch_call_output",
+				"call_id": "call_patch",
+				"status":  "completed",
+				"output":  "Success. Updated the following files:\nM README.md",
+			},
+		},
+		"tools": []any{
+			map[string]any{"type": "apply_patch"},
+		},
+	}
+
+	result, ok := maybeBuildCodexApplyPatchCompletionResult("gpt-test", body)
+	if !ok {
+		t.Fatal("expected native apply_patch output to produce local completion")
+	}
+	if !strings.Contains(result.Payload["output_text"].(string), "README.md") {
 		t.Fatalf("expected final text to include updated file, got %#v", result.Payload["output_text"])
 	}
 }
@@ -1285,5 +1543,130 @@ func TestResponsesPromptPartsFromBodyMergesPendingToolContext(t *testing.T) {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("expected merged prompt to contain %q, got %q", want, prompt)
 		}
+	}
+}
+
+func TestResponseStoreRetrieveDeleteAndInputItems(t *testing.T) {
+	cfg := config.Default()
+	cfg.Storage.ResponseTTLSeconds = 60
+	svc := &OpenAIService{cfg: cfg}
+	body := map[string]any{
+		"store": true,
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "one"},
+				},
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_x",
+				"output":  "out",
+			},
+		},
+	}
+	opts := OpenAIRequestOptions{APIKeyID: 7}
+	result := CompletionResult{
+		Payload: map[string]any{
+			"id":     "resp_test",
+			"object": "response",
+			"status": "completed",
+			"output": []any{},
+		},
+		Model: "gpt-test",
+	}
+
+	svc.storeResponseResult(body, opts, result)
+
+	got, err := svc.ResponseByID(context.Background(), "resp_test", opts)
+	if err != nil {
+		t.Fatalf("expected stored response, got error %v", err)
+	}
+	if got["id"] != "resp_test" || got["object"] != "response" {
+		t.Fatalf("unexpected stored response %#v", got)
+	}
+	if _, err := svc.ResponseByID(context.Background(), "resp_test", OpenAIRequestOptions{APIKeyID: 8}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected API-key isolated not found, got %v", err)
+	}
+
+	page, err := svc.ResponseInputItems(context.Background(), "resp_test", 1, "", opts)
+	if err != nil {
+		t.Fatalf("expected input item page, got error %v", err)
+	}
+	if page["object"] != "list" || page["has_more"] != true {
+		t.Fatalf("unexpected first page metadata %#v", page)
+	}
+	data := page["data"].([]any)
+	if len(data) != 1 {
+		t.Fatalf("expected one input item on first page, got %#v", data)
+	}
+	first := data[0].(map[string]any)
+	if first["id"] == "" || first["type"] != "message" {
+		t.Fatalf("unexpected first input item %#v", first)
+	}
+	lastID, ok := page["last_id"].(string)
+	if !ok || lastID == "" {
+		t.Fatalf("expected first page last_id, got %#v", page["last_id"])
+	}
+
+	page, err = svc.ResponseInputItems(context.Background(), "resp_test", 10, lastID, opts)
+	if err != nil {
+		t.Fatalf("expected second input item page, got error %v", err)
+	}
+	if page["has_more"] != false {
+		t.Fatalf("unexpected second page metadata %#v", page)
+	}
+	data = page["data"].([]any)
+	if len(data) != 1 {
+		t.Fatalf("expected one input item on second page, got %#v", data)
+	}
+	second := data[0].(map[string]any)
+	if second["type"] != "function_call_output" || second["call_id"] != "call_x" {
+		t.Fatalf("unexpected second input item %#v", second)
+	}
+
+	deleted, err := svc.DeleteResponse(context.Background(), "resp_test", opts)
+	if err != nil {
+		t.Fatalf("expected delete response, got error %v", err)
+	}
+	if deleted["id"] != "resp_test" || deleted["deleted"] != true {
+		t.Fatalf("unexpected delete payload %#v", deleted)
+	}
+	if _, err := svc.ResponseByID(context.Background(), "resp_test", opts); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected deleted response to be gone, got %v", err)
+	}
+}
+
+func TestResponseStoreHonorsStoreAndPersistFlags(t *testing.T) {
+	cfg := config.Default()
+	svc := &OpenAIService{cfg: cfg}
+	opts := OpenAIRequestOptions{APIKeyID: 7}
+	result := CompletionResult{Payload: map[string]any{"id": "resp_store_false", "object": "response"}}
+
+	svc.storeResponseResult(map[string]any{"store": false, "input": "hello"}, opts, result)
+	if _, err := svc.ResponseByID(context.Background(), "resp_store_false", opts); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("store=false response should not be stored, got %v", err)
+	}
+
+	cfg.Storage.PersistResponses = false
+	svc = &OpenAIService{cfg: cfg}
+	result.Payload["id"] = "resp_persist_false"
+	svc.storeResponseResult(map[string]any{"store": true, "input": "hello"}, opts, result)
+	if _, err := svc.ResponseByID(context.Background(), "resp_persist_false", opts); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("persist_responses=false response should not be stored, got %v", err)
+	}
+}
+
+func TestResponsesToolOutputTextParsesJSONShellOutput(t *testing.T) {
+	text := responsesToolOutputText(`{"stdout":"ok\n","stderr":""}`)
+	if text != "ok" {
+		t.Fatalf("expected stdout from JSON shell output, got %q", text)
+	}
+
+	text = responsesToolOutputText(`[{"type":"output_text","text":"one"},{"type":"output_text","text":"two"}]`)
+	if text != "one\ntwo" {
+		t.Fatalf("expected joined JSON content output, got %q", text)
 	}
 }

@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"notaion2api/backend/internal/config"
-	"notaion2api/backend/internal/model"
+	"notion2api/backend/internal/config"
+	"notion2api/backend/internal/model"
 )
 
 func TestExtractNotionTextFromAgentInferenceEvent(t *testing.T) {
@@ -95,6 +95,57 @@ func TestExtractNotionTextFromPatchStream(t *testing.T) {
 	}
 	if messageID != "assistant-1" {
 		t.Fatalf("expected assistant message id, got %q", messageID)
+	}
+}
+
+func TestConsumeNotionTextStreamEmitsTextDeltas(t *testing.T) {
+	const want = "Hello streaming world"
+	raw := notionTestLines(t,
+		map[string]any{
+			"type": "patch-start",
+			"data": map[string]any{
+				"s": []any{
+					map[string]any{"id": "user-1", "type": "user", "value": []any{}},
+					map[string]any{"id": "assistant-1", "type": "agent-inference", "value": []any{map[string]any{"type": "text", "content": ""}}},
+				},
+			},
+		},
+		map[string]any{
+			"type": "patch",
+			"v": []any{
+				map[string]any{"o": "x", "p": "/s/1/value/0/content", "v": "Hello "},
+			},
+		},
+		map[string]any{
+			"type": "patch",
+			"v": []any{
+				map[string]any{"o": "x", "p": "/s/1/value/0/content", "v": "streaming world"},
+			},
+		},
+		map[string]any{
+			"type": "patch",
+			"v": []any{
+				map[string]any{"o": "a", "p": "/s/1/finishedAt", "v": "2026-06-16T08:42:29.000Z"},
+			},
+		},
+	)
+
+	deltas := []string{}
+	result, err := consumeNotionTextStream(io.NopCloser(strings.NewReader(raw)), "thread-1", 50*time.Millisecond, "req-test", func(delta string) error {
+		deltas = append(deltas, delta)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != want {
+		t.Fatalf("expected final text %q, got %q", want, result.Text)
+	}
+	if joined := strings.Join(deltas, ""); joined != want {
+		t.Fatalf("expected streamed deltas to compose %q, got %q from %#v", want, joined, deltas)
+	}
+	if len(deltas) < 2 {
+		t.Fatalf("expected incremental deltas, got %#v", deltas)
 	}
 }
 

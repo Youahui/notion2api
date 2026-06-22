@@ -4,10 +4,10 @@ import (
 	"net/http"
 	"strconv"
 
-	"notaion2api/backend/internal/dto"
-	"notaion2api/backend/internal/pkg/requestctx"
-	"notaion2api/backend/internal/pkg/respond"
-	"notaion2api/backend/internal/repository"
+	"notion2api/backend/internal/dto"
+	"notion2api/backend/internal/pkg/requestctx"
+	"notion2api/backend/internal/pkg/respond"
+	"notion2api/backend/internal/repository"
 
 	"github.com/gin-gonic/gin"
 )

@@ -107,7 +107,7 @@ func Default() Config {
 		},
 		Database: DatabaseConfig{
 			Driver:                 "sqlite",
-			DSN:                    "data/notaion2api.sqlite",
+			DSN:                    "data/notion2api.sqlite",
 			MaxIdleConns:           5,
 			MaxOpenConns:           20,
 			ConnMaxLifetimeSeconds: 3600,
