@@ -523,6 +523,38 @@ func TestMaybeBuildCodexFileToolCallResultSkipsImmediatelyAfterToolOutput(t *tes
 	}
 }
 
+func TestMaybeBuildCodexFileToolCallResultSkipsRepeatedReadWhenUserTextTrailsToolOutput(t *testing.T) {
+	body := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type":      "function_call",
+				"call_id":   "call_read",
+				"name":      "exec_command",
+				"arguments": `{"cmd":"sed -n '1,400p' Dockerfile","yield_time_ms":10000,"max_output_tokens":20000}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_read",
+				"output":  "FROM alpine\n",
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "帮我查看 [Dockerfile](Dockerfile)"},
+				},
+			},
+		},
+		"tools": []any{
+			map[string]any{"type": "function", "name": "exec_command"},
+		},
+	}
+
+	if _, ok := maybeBuildCodexFileToolCallResult("gpt-test", body); ok {
+		t.Fatal("already-read file should not produce another file-read tool call")
+	}
+}
+
 func TestMaybeBuildCodexFileToolCallResultDoesNotReuseOldFileWhenLatestUserHasNoFile(t *testing.T) {
 	body := map[string]any{
 		"input": []any{
@@ -819,6 +851,33 @@ func TestMaybeBuildCodexAssistantTextToolCallResultConvertsApplyPatch(t *testing
 	}
 }
 
+func TestMaybeBuildCodexAssistantTextToolCallResultNormalizesApplyPatchHunkHeader(t *testing.T) {
+	body := map[string]any{
+		"input": "帮我更新 README.md",
+		"tools": []any{
+			map[string]any{"type": "custom", "name": "apply_patch"},
+		},
+	}
+	answer := "*** Begin Patch\n*** Update File: README.md\n@@ -1,2 +1,2 @@\n-old\n+new\n*** End Patch"
+
+	result, ok := maybeBuildCodexAssistantTextToolCallResult("gpt-test", body, answer, nil)
+	if !ok {
+		t.Fatal("expected assistant patch text to be converted")
+	}
+	item := result.Payload["output"].([]any)[0].(map[string]any)
+	defer pendingResponseContexts.Delete("resp:" + result.Payload["id"].(string))
+	defer pendingResponseContexts.Delete("call:" + item["call_id"].(string))
+	input := item["input"].(string)
+	if strings.Contains(input, "@@ -1,2 +1,2 @@") {
+		t.Fatalf("standard unified hunk header should be normalized for Codex apply_patch: %q", input)
+	}
+	for _, want := range []string{"*** Begin Patch", "*** Update File: README.md", "@@\n", "-old", "+new", "*** End Patch"} {
+		if !strings.Contains(input, want) {
+			t.Fatalf("expected normalized patch to contain %q, got %q", want, input)
+		}
+	}
+}
+
 func TestMaybeBuildCodexAssistantTextToolCallResultConvertsNamespacedApplyPatch(t *testing.T) {
 	body := map[string]any{
 		"input": "修改 @README.md",
@@ -969,10 +1028,13 @@ func TestMaybeBuildCodexAssistantTextToolCallResultConvertsUnifiedDiffPatch(t *t
 	defer pendingResponseContexts.Delete("resp:" + result.Payload["id"].(string))
 	defer pendingResponseContexts.Delete("call:" + item["call_id"].(string))
 	input := item["input"].(string)
-	for _, want := range []string{"*** Begin Patch", "*** Update File: README.md", "@@ -1,2 +1,2 @@", "-old", "+new", "*** End Patch"} {
+	for _, want := range []string{"*** Begin Patch", "*** Update File: README.md", "@@\n", "-old", "+new", "*** End Patch"} {
 		if !strings.Contains(input, want) {
 			t.Fatalf("expected converted patch to contain %q, got %q", want, input)
 		}
+	}
+	if strings.Contains(input, "@@ -1,2 +1,2 @@") {
+		t.Fatalf("standard unified hunk header should be normalized for Codex apply_patch: %q", input)
 	}
 	if strings.Contains(input, "diff --git") || strings.Contains(input, "--- a/") || strings.Contains(input, "+++ b/") {
 		t.Fatalf("converted patch should not keep unified diff headers: %q", input)

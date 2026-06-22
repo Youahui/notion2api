@@ -218,6 +218,7 @@ func summarizeInputForLog(value any) map[string]any {
 	typeCounts := map[string]int{}
 	userTexts := []string{}
 	fileRefs := []string{}
+	toolOutputs := []map[string]any{}
 	var walk func(any)
 	walk = func(item any) {
 		switch typed := item.(type) {
@@ -246,6 +247,11 @@ func summarizeInputForLog(value any) map[string]any {
 					fileRefs = append(fileRefs, fileRefsFromLogText(text)...)
 				}
 			}
+			if isToolOutputLogItem(role, itemType) {
+				if output := toolOutputSummaryForLog(typed); len(output) > 0 {
+					toolOutputs = append(toolOutputs, output)
+				}
+			}
 			if content, ok := typed["content"]; ok {
 				walk(content)
 			}
@@ -267,7 +273,61 @@ func summarizeInputForLog(value any) map[string]any {
 	if refs := uniqueStrings(fileRefs, 12); len(refs) > 0 {
 		summary["file_refs"] = refs
 	}
+	if len(toolOutputs) > 0 {
+		if len(toolOutputs) > 5 {
+			toolOutputs = toolOutputs[len(toolOutputs)-5:]
+		}
+		summary["last_tool_outputs"] = toolOutputs
+	}
 	return summary
+}
+
+func isToolOutputLogItem(role string, itemType string) bool {
+	role = strings.ToLower(strings.TrimSpace(role))
+	itemType = strings.ToLower(strings.TrimSpace(itemType))
+	return role == "tool" ||
+		itemType == "function_call_output" ||
+		itemType == "custom_tool_call_output" ||
+		itemType == "tool_result"
+}
+
+func toolOutputSummaryForLog(item map[string]any) map[string]any {
+	out := map[string]any{}
+	if itemType := stringValue(item["type"]); itemType != "" {
+		out["type"] = itemType
+	}
+	if callID := stringValue(item["call_id"]); callID != "" {
+		out["call_id"] = callID
+	}
+	if text := logValueText(firstNonEmptyLogValue(item["output"], item["content"])); text != "" {
+		out["output_preview"] = truncateLogText(redactSensitiveText(text), 360)
+	}
+	return out
+}
+
+func firstNonEmptyLogValue(values ...any) any {
+	for _, value := range values {
+		if strings.TrimSpace(logValueText(value)) != "" {
+			return value
+		}
+	}
+	return nil
+}
+
+func logValueText(value any) string {
+	if text := textFromLogContent(value); text != "" {
+		return text
+	}
+	switch typed := value.(type) {
+	case map[string]any, []any:
+		encoded, err := json.Marshal(redactJSONValue(typed))
+		if err != nil {
+			return ""
+		}
+		return string(encoded)
+	default:
+		return ""
+	}
 }
 
 func textFromLogContent(value any) string {

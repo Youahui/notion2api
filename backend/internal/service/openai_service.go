@@ -92,6 +92,7 @@ var (
 	codexFencedCodeBlockPattern    = regexp.MustCompile("(?s)```([A-Za-z0-9_-]*)\\s*\\n(.*?)\\n```")
 	codexToolResultBlockPattern    = regexp.MustCompile(`(?s)<tool_result\b[^>]*>.*?</tool_result>\s*`)
 	codexContextResultBlockPattern = regexp.MustCompile(`(?s)<context_result\b[^>]*>.*?</context_result>\s*`)
+	codexUnifiedHunkHeaderPattern  = regexp.MustCompile(`^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@(?:\s.*)?$`)
 	responsesEnvContextPattern     = regexp.MustCompile(`(?s)<environment_context>.*?</environment_context>\s*`)
 	responsesToolCallPattern       = regexp.MustCompile(`(?s)<tool_call\b[^>]*>.*?</tool_call>\s*`)
 	responsesToolResultOpenTag     = regexp.MustCompile(`<tool_result\b[^>]*>`)
@@ -2438,6 +2439,10 @@ func maybeBuildCodexApplyPatchToolCallResult(modelID string, body map[string]any
 }
 
 func buildCodexFileToolCallResult(modelID string, body map[string]any, files []string, reason string, baseTrace map[string]any) (CompletionResult, bool) {
+	files = filterUnreadCodexFiles(body["input"], files)
+	if len(files) == 0 {
+		return CompletionResult{}, false
+	}
 	calls, ok := codexFileReadToolCalls(body["tools"], body["tool_choice"], files, boolFromMapDefault(body, "parallel_tool_calls", true))
 	if !ok || len(calls) == 0 {
 		return CompletionResult{}, false
@@ -2555,6 +2560,164 @@ func codexFileReadToolCalls(tools any, toolChoice any, files []string, parallel 
 	default:
 		return nil, false
 	}
+}
+
+func filterUnreadCodexFiles(input any, files []string) []string {
+	if len(files) == 0 {
+		return nil
+	}
+	read := codexAlreadyReadFiles(input)
+	if len(read) == 0 {
+		return files
+	}
+	out := make([]string, 0, len(files))
+	for _, file := range files {
+		clean := strings.TrimSpace(file)
+		if clean == "" {
+			continue
+		}
+		if _, ok := read[codexFileKey(clean)]; ok {
+			continue
+		}
+		out = append(out, clean)
+	}
+	return out
+}
+
+func codexAlreadyReadFiles(input any) map[string]struct{} {
+	readCallIDs := responseToolOutputCallIDSet(input)
+	if len(readCallIDs) == 0 {
+		return nil
+	}
+	files := map[string]struct{}{}
+	var walk func(any)
+	walk = func(value any) {
+		switch typed := value.(type) {
+		case []any:
+			for _, item := range typed {
+				walk(item)
+			}
+		case []map[string]any:
+			for _, item := range typed {
+				walk(item)
+			}
+		case map[string]any:
+			itemType := strings.ToLower(strings.TrimSpace(stringFromAny(typed["type"])))
+			if itemType == "function_call" {
+				callID := strings.TrimSpace(stringFromAny(typed["call_id"]))
+				if _, ok := readCallIDs[callID]; ok {
+					for _, file := range codexReadFilesFromToolCall(typed) {
+						files[codexFileKey(file)] = struct{}{}
+					}
+				}
+			}
+			if content, ok := typed["content"]; ok {
+				walk(content)
+			}
+		}
+	}
+	walk(input)
+	if len(files) == 0 {
+		return nil
+	}
+	return files
+}
+
+func responseToolOutputCallIDSet(input any) map[string]struct{} {
+	ids := responseToolOutputCallIDs(input)
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if clean := strings.TrimSpace(id); clean != "" {
+			out[clean] = struct{}{}
+		}
+	}
+	return out
+}
+
+func codexReadFilesFromToolCall(item map[string]any) []string {
+	name := strings.TrimSpace(stringFromAny(item["name"]))
+	if name == "" {
+		return nil
+	}
+	arguments := mapFromJSONString(stringFromAny(item["arguments"]))
+	if arguments == nil {
+		return nil
+	}
+	switch {
+	case responseToolNameMatches(name, "connections.fs.readFiles"):
+		return stringsFromAny(arguments["files"])
+	case responseToolNameMatches(name, "connections.fs.readFile"):
+		if file := strings.TrimSpace(stringFromAny(arguments["file"])); file != "" {
+			return []string{file}
+		}
+	case responseToolNameMatches(name, "exec_command"):
+		if file := codexReadFileFromCommand(stringFromAny(arguments["cmd"])); file != "" {
+			return []string{file}
+		}
+	}
+	return nil
+}
+
+func mapFromJSONString(text string) map[string]any {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	var out map[string]any
+	if err := json.Unmarshal([]byte(text), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+func stringsFromAny(value any) []string {
+	items := sliceFromAny(value)
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if text := strings.TrimSpace(stringFromAny(item)); text != "" {
+			out = append(out, text)
+		}
+	}
+	return out
+}
+
+func codexReadFileFromCommand(cmd string) string {
+	cmd = strings.TrimSpace(cmd)
+	if cmd == "" || !strings.Contains(cmd, "sed -n '1,400p'") {
+		return ""
+	}
+	prefix := "sed -n '1,400p' "
+	if !strings.HasPrefix(cmd, prefix) {
+		return ""
+	}
+	file := strings.TrimSpace(strings.TrimPrefix(cmd, prefix))
+	return strings.TrimSpace(unquoteShellToken(file))
+}
+
+func unquoteShellToken(token string) string {
+	token = strings.TrimSpace(token)
+	if len(token) >= 2 && token[0] == '\'' && token[len(token)-1] == '\'' {
+		inner := token[1 : len(token)-1]
+		inner = strings.ReplaceAll(inner, `'\''`, "'")
+		return strings.ReplaceAll(inner, `'"'"'`, "'")
+	}
+	if len(token) >= 2 && token[0] == '"' && token[len(token)-1] == '"' {
+		var unquoted string
+		if err := json.Unmarshal([]byte(token), &unquoted); err == nil {
+			return unquoted
+		}
+	}
+	return token
+}
+
+func codexFileKey(file string) string {
+	return strings.TrimPrefix(strings.TrimSpace(file), "./")
 }
 
 func responseToolAvailable(tools any, toolChoice any, name string) bool {
@@ -3019,7 +3182,22 @@ func normalizeCodexApplyPatch(text string) string {
 		return ""
 	}
 	patch := text[start : start+end+len("*** End Patch")]
-	return strings.TrimSpace(patch) + "\n"
+	return normalizeCodexApplyPatchHunkHeaders(strings.TrimSpace(patch)) + "\n"
+}
+
+func normalizeCodexApplyPatchHunkHeaders(patch string) string {
+	lines := strings.Split(strings.ReplaceAll(patch, "\r\n", "\n"), "\n")
+	for i, line := range lines {
+		lines[i] = normalizeCodexApplyPatchHunkHeader(line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func normalizeCodexApplyPatchHunkHeader(line string) string {
+	if codexUnifiedHunkHeaderPattern.MatchString(strings.TrimSpace(line)) {
+		return "@@"
+	}
+	return line
 }
 
 func codexUnifiedDiffToApplyPatch(text string) string {
@@ -3065,7 +3243,7 @@ func codexUnifiedDiffToApplyPatch(text string) string {
 		}
 		if strings.HasPrefix(line, "@@") {
 			inHunk = true
-			current.lines = append(current.lines, line)
+			current.lines = append(current.lines, normalizeCodexApplyPatchHunkHeader(line))
 			continue
 		}
 		if inHunk {
