@@ -227,6 +227,8 @@ curl http://127.0.0.1:9998/v1/responses \
   }'
 ```
 
+Codex 原生 Responses 请求会在本地兼容 `@README.md` / `@path/file` 文件引用、`exec_command` 文件读取工具和 `apply_patch` 自定义工具；工具名带命名空间时也会按客户端声明名返回。
+
 ### 兼容客户端配置
 
 大多数支持 OpenAI 兼容接口的客户端只需要改 Base URL 和 API Key：

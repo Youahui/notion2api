@@ -82,7 +82,8 @@ type responseFunctionToolCall struct {
 
 var (
 	codexMarkdownFileLinkPattern   = regexp.MustCompile(`\[([^\]\n]{1,512})\]\(([^)\s]+)\)`)
-	codexPlainFileRefPattern       = regexp.MustCompile(`(?:^|[\s"'` + "`" + `([{<，。！？、：；,;:!?])([A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)*|Dockerfile|Makefile|compose\.ya?ml|docker-compose\.ya?ml)(?:$|[\s"'` + "`" + `)\]}>，。！？、：；,;:!?])`)
+	codexAtFileRefPattern          = regexp.MustCompile(`(?:^|[\s"'` + "`" + `([{<，。！？、：；,;:!?])@([A-Za-z0-9_.+-]+(?:/[A-Za-z0-9_.+-]+)*|Dockerfile|Makefile|compose\.ya?ml|docker-compose\.ya?ml)(?:$|[\s"'` + "`" + `)\]}>，。！？、：；,;:!?])`)
+	codexPlainFileRefPattern       = regexp.MustCompile(`(?:^|[\s"'` + "`" + `([{<，。！？、：；,;:!?])([A-Za-z0-9_.+-]+(?:/[A-Za-z0-9_.+-]+)*|Dockerfile|Makefile|compose\.ya?ml|docker-compose\.ya?ml)(?:$|[\s"'` + "`" + `)\]}>，。！？、：；,;:!?])`)
 	codexQuotedFilesPattern        = regexp.MustCompile(`(?i)"files"\s*:\s*\[([^\]]*)\]`)
 	codexQuotedFilePattern         = regexp.MustCompile(`(?i)"file"\s*:\s*"([^"]{1,512})"`)
 	codexJSONStringPattern         = regexp.MustCompile(`"([^"\\]*(?:\\.[^"\\]*)*)"`)
@@ -2292,7 +2293,8 @@ func maybeBuildCodexDeterministicEditToolCallResult(modelID string, body map[str
 	if body == nil || !responsesInputHasToolOutput(body["input"]) || responsesInputHasBlockingApplyPatchToolState(body["input"]) || isCodexTitleGenerationRequest(body) {
 		return CompletionResult{}, false
 	}
-	if !responseHasTool(body["tools"], "apply_patch") || !responseToolChoiceAllowsTool(body["tool_choice"], "apply_patch") {
+	patchToolName, ok := responseToolName(body["tools"], "apply_patch")
+	if !ok || !responseToolChoiceAllowsTool(body["tool_choice"], patchToolName) {
 		return CompletionResult{}, false
 	}
 	prompt, hiddenPrompt, hiddenMessages := responsesPromptPartsFromBody(body)
@@ -2322,7 +2324,7 @@ func maybeBuildCodexDeterministicEditToolCallResult(modelID string, body map[str
 	trace := map[string]any{
 		"converted_only": true,
 		"tool_call": map[string]any{
-			"name":          "apply_patch",
+			"name":          patchToolName,
 			"reason":        "deterministic_edit",
 			"input_chars":   utf8.RuneCountInString(patch),
 			"input_preview": truncateRunes(collapseWhitespace(patch), 180),
@@ -2337,7 +2339,7 @@ func maybeBuildCodexDeterministicEditToolCallResult(modelID string, body map[str
 		HiddenPrompt:   hiddenPrompt,
 		HiddenMessages: hiddenMessages,
 	})
-	payload := buildResponsesCustomToolCallPayload(modelID, "apply_patch", patch, callID, usage, responseID, newResponsesID("ctc"), time.Now().Unix(), body, trace)
+	payload := buildResponsesCustomToolCallPayload(modelID, patchToolName, patch, callID, usage, responseID, newResponsesID("ctc"), time.Now().Unix(), body, trace)
 	return CompletionResult{Payload: payload, Usage: usage, Model: modelID, Trace: trace}, true
 }
 
@@ -2380,7 +2382,11 @@ func maybeBuildCodexApplyPatchCompletionResult(modelID string, body map[string]a
 }
 
 func maybeBuildCodexApplyPatchToolCallResult(modelID string, body map[string]any, answer string, baseTrace map[string]any) (CompletionResult, bool) {
-	if body == nil || !responseHasTool(body["tools"], "apply_patch") || !responseToolChoiceAllowsTool(body["tool_choice"], "apply_patch") || responsesInputHasBlockingApplyPatchToolState(body["input"]) {
+	if body == nil || responsesInputHasBlockingApplyPatchToolState(body["input"]) {
+		return CompletionResult{}, false
+	}
+	patchToolName, ok := responseToolName(body["tools"], "apply_patch")
+	if !ok || !responseToolChoiceAllowsTool(body["tool_choice"], patchToolName) {
 		return CompletionResult{}, false
 	}
 	prompt, hiddenPrompt, hiddenMessages := responsesPromptPartsFromBody(body)
@@ -2413,7 +2419,7 @@ func maybeBuildCodexApplyPatchToolCallResult(modelID string, body map[string]any
 	}
 	trace["assistant_text_tool_call_converted"] = true
 	trace["tool_call"] = map[string]any{
-		"name":          "apply_patch",
+		"name":          patchToolName,
 		"reason":        "assistant_text_apply_patch",
 		"input_chars":   utf8.RuneCountInString(patch),
 		"input_preview": truncateRunes(collapseWhitespace(patch), 180),
@@ -2427,7 +2433,7 @@ func maybeBuildCodexApplyPatchToolCallResult(modelID string, body map[string]any
 		HiddenPrompt:   hiddenPrompt,
 		HiddenMessages: hiddenMessages,
 	})
-	payload := buildResponsesCustomToolCallPayload(modelID, "apply_patch", patch, callID, usage, responseID, newResponsesID("ctc"), time.Now().Unix(), body, trace)
+	payload := buildResponsesCustomToolCallPayload(modelID, patchToolName, patch, callID, usage, responseID, newResponsesID("ctc"), time.Now().Unix(), body, trace)
 	return CompletionResult{Payload: payload, Usage: usage, Model: modelID, Trace: trace}, true
 }
 
@@ -2507,13 +2513,15 @@ func codexFileReadToolCalls(tools any, toolChoice any, files []string, parallel 
 		return nil, false
 	}
 	switch {
-	case responseHasTool(tools, "connections.fs.readFiles") && responseToolChoiceAllowsTool(toolChoice, "connections.fs.readFiles"):
+	case responseToolAvailable(tools, toolChoice, "connections.fs.readFiles"):
+		toolName, _ := responseToolName(tools, "connections.fs.readFiles")
 		arguments, err := json.Marshal(map[string]any{"files": files})
 		if err != nil {
 			return nil, false
 		}
-		return []responseFunctionToolCall{{Name: "connections.fs.readFiles", Arguments: string(arguments)}}, true
-	case responseHasTool(tools, "connections.fs.readFile") && responseToolChoiceAllowsTool(toolChoice, "connections.fs.readFile"):
+		return []responseFunctionToolCall{{Name: toolName, Arguments: string(arguments)}}, true
+	case responseToolAvailable(tools, toolChoice, "connections.fs.readFile"):
+		toolName, _ := responseToolName(tools, "connections.fs.readFile")
 		if !parallel && len(files) > 1 {
 			files = files[:1]
 		}
@@ -2523,10 +2531,11 @@ func codexFileReadToolCalls(tools any, toolChoice any, files []string, parallel 
 			if err != nil {
 				return nil, false
 			}
-			calls = append(calls, responseFunctionToolCall{Name: "connections.fs.readFile", Arguments: string(arguments)})
+			calls = append(calls, responseFunctionToolCall{Name: toolName, Arguments: string(arguments)})
 		}
 		return calls, len(calls) > 0
-	case responseHasTool(tools, "exec_command") && responseToolChoiceAllowsTool(toolChoice, "exec_command"):
+	case responseToolAvailable(tools, toolChoice, "exec_command"):
+		toolName, _ := responseToolName(tools, "exec_command")
 		if !parallel && len(files) > 1 {
 			files = files[:1]
 		}
@@ -2540,7 +2549,7 @@ func codexFileReadToolCalls(tools any, toolChoice any, files []string, parallel 
 			if err != nil {
 				return nil, false
 			}
-			calls = append(calls, responseFunctionToolCall{Name: "exec_command", Arguments: string(arguments)})
+			calls = append(calls, responseFunctionToolCall{Name: toolName, Arguments: string(arguments)})
 		}
 		return calls, len(calls) > 0
 	default:
@@ -2548,7 +2557,17 @@ func codexFileReadToolCalls(tools any, toolChoice any, files []string, parallel 
 	}
 }
 
+func responseToolAvailable(tools any, toolChoice any, name string) bool {
+	toolName, ok := responseToolName(tools, name)
+	return ok && responseToolChoiceAllowsTool(toolChoice, toolName)
+}
+
 func responseHasTool(tools any, names ...string) bool {
+	_, ok := responseToolName(tools, names...)
+	return ok
+}
+
+func responseToolName(tools any, names ...string) (string, bool) {
 	wanted := make(map[string]struct{}, len(names))
 	for _, name := range names {
 		if clean := strings.TrimSpace(name); clean != "" {
@@ -2560,16 +2579,56 @@ func responseHasTool(tools any, names ...string) bool {
 		if tool == nil {
 			continue
 		}
-		if _, ok := wanted[stringFromAny(tool["name"])]; ok {
-			return true
-		}
-		if function := mapFromAny(tool["function"]); function != nil {
-			if _, ok := wanted[stringFromAny(function["name"])]; ok {
-				return true
+		for _, candidate := range responseToolCandidateNames(tool) {
+			for wantedName := range wanted {
+				if responseToolNameMatches(candidate, wantedName) {
+					return candidate, true
+				}
 			}
 		}
 	}
-	return false
+	return "", false
+}
+
+func responseToolCandidateNames(tool map[string]any) []string {
+	if tool == nil {
+		return nil
+	}
+	names := []string{}
+	if name := strings.TrimSpace(stringFromAny(tool["name"])); name != "" {
+		names = append(names, name)
+	}
+	if function := mapFromAny(tool["function"]); function != nil {
+		if name := strings.TrimSpace(stringFromAny(function["name"])); name != "" {
+			names = append(names, name)
+		}
+	}
+	if custom := mapFromAny(tool["custom"]); custom != nil {
+		if name := strings.TrimSpace(stringFromAny(custom["name"])); name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func responseToolNameMatches(actual string, wanted string) bool {
+	actual = strings.TrimSpace(actual)
+	wanted = strings.TrimSpace(wanted)
+	if actual == "" || wanted == "" {
+		return false
+	}
+	if strings.EqualFold(actual, wanted) {
+		return true
+	}
+	return strings.EqualFold(responseToolBaseName(actual), responseToolBaseName(wanted))
+}
+
+func responseToolBaseName(name string) string {
+	name = strings.TrimSpace(name)
+	if idx := strings.LastIndex(name, "."); idx >= 0 && idx < len(name)-1 {
+		return name[idx+1:]
+	}
+	return name
 }
 
 func responseToolChoiceAllowsTool(toolChoice any, toolName string) bool {
@@ -2582,7 +2641,7 @@ func responseToolChoiceAllowsTool(toolChoice any, toolName string) bool {
 	case "none":
 		return false
 	case "named":
-		return strings.EqualFold(selectedName, toolName)
+		return responseToolNameMatches(selectedName, toolName)
 	default:
 		return true
 	}
@@ -2705,6 +2764,25 @@ func codexFileRefsFromText(text string) []string {
 		files = append(files, file)
 		if len(files) >= 8 {
 			break
+		}
+	}
+	if len(files) < 8 {
+		for _, match := range codexAtFileRefPattern.FindAllStringSubmatch(text, -1) {
+			if len(match) < 2 {
+				continue
+			}
+			file := normalizeCodexFileRef(match[1], match[1])
+			if file == "" || !codexLooksLikePlainFileRef(file) {
+				continue
+			}
+			if _, exists := seen[file]; exists {
+				continue
+			}
+			seen[file] = struct{}{}
+			files = append(files, file)
+			if len(files) >= 8 {
+				break
+			}
 		}
 	}
 	if len(files) < 8 && codexTextHasFileReadIntent(text) {
@@ -3347,6 +3425,7 @@ func normalizeCodexFileRef(label string, target string) string {
 	}
 	target = strings.Trim(strings.TrimSpace(target), "/")
 	target = strings.TrimPrefix(target, "./")
+	target = strings.TrimPrefix(target, "@")
 	if target == "" || strings.Contains(target, "\x00") || strings.HasPrefix(target, "~") || strings.HasPrefix(target, "/") {
 		return ""
 	}
@@ -3410,7 +3489,7 @@ func responsesInputHasApplyPatchToolOutput(input any) bool {
 		return false
 	case map[string]any:
 		itemType := strings.ToLower(strings.TrimSpace(stringFromAny(typed["type"])))
-		if itemType == "custom_tool_call" && strings.EqualFold(stringFromAny(typed["name"]), "apply_patch") {
+		if itemType == "custom_tool_call" && responseToolNameMatches(stringFromAny(typed["name"]), "apply_patch") {
 			return true
 		}
 		if itemType == "custom_tool_call_output" {
@@ -3448,7 +3527,7 @@ func responsesInputHasApplyPatchToolCall(input any) bool {
 		return false
 	case map[string]any:
 		itemType := strings.ToLower(strings.TrimSpace(stringFromAny(typed["type"])))
-		if itemType == "custom_tool_call" && strings.EqualFold(stringFromAny(typed["name"]), "apply_patch") {
+		if itemType == "custom_tool_call" && responseToolNameMatches(stringFromAny(typed["name"]), "apply_patch") {
 			return true
 		}
 		return responsesInputHasApplyPatchToolCall(typed["content"])
@@ -3727,7 +3806,7 @@ func responseToolBridgeInstruction(body map[string]any) string {
 	case "none":
 		return "The client requested a direct answer. Do not emit patch-shaped text unless the user explicitly asks for a concrete edit."
 	case "named":
-		if strings.EqualFold(selected, "apply_patch") {
+		if responseToolNameMatches(selected, "apply_patch") {
 			return "If the user asks for a file or document edit, provide a concrete text patch block instead of saying that file editing is unavailable."
 		}
 		return ""

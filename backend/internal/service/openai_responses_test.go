@@ -563,6 +563,48 @@ func TestCodexFileRefsFromTextRejectsSentenceFragments(t *testing.T) {
 	}
 }
 
+func TestCodexFileRefsFromTextSupportsAtMentions(t *testing.T) {
+	files := codexFileRefsFromText("修改 @README.md，然后检查 @notion2api/backend/configs/config.docker.yaml")
+	want := []string{"README.md", "notion2api/backend/configs/config.docker.yaml"}
+	if len(files) != len(want) {
+		t.Fatalf("expected at mentions %#v, got %#v", want, files)
+	}
+	for idx := range want {
+		if files[idx] != want[idx] {
+			t.Fatalf("expected at mentions %#v, got %#v", want, files)
+		}
+	}
+}
+
+func TestMaybeBuildCodexFileToolCallResultUsesAtMentionAndNamespacedExecCommand(t *testing.T) {
+	body := map[string]any{
+		"input": "修改 @README.md",
+		"tools": []any{
+			map[string]any{"type": "function", "name": "functions.exec_command"},
+		},
+	}
+
+	result, ok := maybeBuildCodexFileToolCallResult("gpt-test", body)
+	if !ok {
+		t.Fatal("expected @ file reference to produce a namespaced tool call")
+	}
+	output := result.Payload["output"].([]any)
+	item := output[0].(map[string]any)
+	defer pendingResponseContexts.Delete("resp:" + result.Payload["id"].(string))
+	defer pendingResponseContexts.Delete("call:" + item["call_id"].(string))
+	if item["name"] != "functions.exec_command" {
+		t.Fatalf("expected namespaced exec tool, got %#v", item)
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(item["arguments"].(string)), &args); err != nil {
+		t.Fatalf("invalid arguments json: %v", err)
+	}
+	cmd := args["cmd"].(string)
+	if !strings.Contains(cmd, "README.md") || strings.Contains(cmd, "@README.md") {
+		t.Fatalf("expected @ mention to be normalized in read command, got %q", cmd)
+	}
+}
+
 func TestMaybeBuildCodexFileToolCallResultHonorsToolChoiceNone(t *testing.T) {
 	body := map[string]any{
 		"input":       "帮我查看 [Dockerfile](Dockerfile)",
@@ -774,6 +816,31 @@ func TestMaybeBuildCodexAssistantTextToolCallResultConvertsApplyPatch(t *testing
 	}
 	if result.Payload["output_text"] != "" {
 		t.Fatalf("custom tool call response should not include assistant text: %#v", result.Payload["output_text"])
+	}
+}
+
+func TestMaybeBuildCodexAssistantTextToolCallResultConvertsNamespacedApplyPatch(t *testing.T) {
+	body := map[string]any{
+		"input": "修改 @README.md",
+		"tools": []any{
+			map[string]any{"type": "custom", "name": "functions.apply_patch"},
+		},
+		"tool_choice": map[string]any{"type": "custom", "name": "apply_patch"},
+	}
+	answer := "*** Begin Patch\n*** Update File: README.md\n@@\n-old\n+new\n*** End Patch"
+
+	result, ok := maybeBuildCodexAssistantTextToolCallResult("gpt-test", body, answer, nil)
+	if !ok {
+		t.Fatal("expected namespaced apply_patch text to be converted")
+	}
+	item := result.Payload["output"].([]any)[0].(map[string]any)
+	defer pendingResponseContexts.Delete("resp:" + result.Payload["id"].(string))
+	defer pendingResponseContexts.Delete("call:" + item["call_id"].(string))
+	if item["type"] != "custom_tool_call" || item["name"] != "functions.apply_patch" {
+		t.Fatalf("expected namespaced custom tool call, got %#v", item)
+	}
+	if !responsesInputHasApplyPatchToolCall([]any{item}) {
+		t.Fatalf("expected namespaced apply_patch call to be detected")
 	}
 }
 
