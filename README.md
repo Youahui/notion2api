@@ -5,14 +5,17 @@
 [![Database](https://img.shields.io/badge/Database-SQLite%20%7C%20PostgreSQL-336791)](https://www.postgresql.org/)
 [![API](https://img.shields.io/badge/API-OpenAI%20Compatible-111827)](#api-用法)
 
-Notion2API 是一个基于 Go 的 Notion AI OpenAI / Codex 兼容桥接服务。它把 Notion AI 的上游协议封装成常见的 `/v1/models`、`/v1/chat/completions`、`/v1/responses` 接口，并提供管理台用于维护 Notion 账号池、API Key、模型、请求日志和用量统计。
+Notion2API 是一个基于 Go 的 Notion AI OpenAI / Codex 兼容桥接服务。它把 Notion AI 的上游协议封装成常见的 `/v1/models`、`/v1/chat/completions`、`/v1/responses` 接口，并提供 Web 管理台用于维护 Notion 账号池、API Key、模型、请求日志和用量统计。
 
 项目定位是私有化部署的 API 网关：客户端继续按 OpenAI 兼容格式调用，本服务负责鉴权、账号调度、Notion 会话请求、响应格式转换、Codex 工具协议适配和本地持久化。
+
+> 适合个人或团队在自有环境中统一接入 Notion AI，并对调用入口、账号池、额度、日志和代理进行集中管理。
 
 ## 目录
 
 - [功能特性](#功能特性)
 - [工作原理](#工作原理)
+- [技术栈](#技术栈)
 - [快速开始](#快速开始)
 - [首次配置流程](#首次配置流程)
 - [接口一览](#接口一览)
@@ -59,6 +62,29 @@ flowchart LR
   Dispatch --> Store
 ```
 
+## 技术栈
+
+### 后端
+
+- Go
+- Gin
+- GORM
+- SQLite / PostgreSQL
+- Server-Sent Events
+
+### 前端
+
+- React
+- Vite
+- TypeScript
+- Ant Design
+
+### 部署
+
+- Docker
+- Docker Compose
+- Nginx 前端静态服务与反向代理
+
 ## 快速开始
 
 以下命令默认在项目根目录执行。
@@ -93,11 +119,12 @@ VITE_API_BASE_URL=http://127.0.0.1:9998 pnpm dev
 - 示例配置默认密码：`change-me-please`
 - 示例配置默认 API Key：`<api_key>`
 
-首次运行后建议立即修改管理员密码，并重新创建自己的 API Key。
+首次运行后请立即修改管理员密码，并重新创建自己的 API Key。
 
 ### 方式二：Docker Compose
 
 Docker Compose 默认同时启动后端和管理台前端：
+
 - 后端 API：宿主机 `9998` -> 容器 `9998`
 - 前端管理台：宿主机 `8080` -> Nginx 容器 `80`
 - 前端容器会把 `/api/*` 反向代理到后端 `backend:9998`
@@ -131,6 +158,14 @@ N2A_DATABASE_DRIVER=postgres \
 N2A_DATABASE_DSN='host=postgres user=notion2api password=change-me dbname=notion2api port=5432 sslmode=disable TimeZone=Asia/Shanghai' \
 docker compose up -d --build backend
 ```
+
+### 方式三：仅构建镜像
+
+```bash
+docker build -t notion2api:latest .
+```
+
+运行时请根据实际环境挂载配置文件或通过环境变量覆盖配置。
 
 ## 首次配置流程
 
@@ -237,6 +272,8 @@ Codex 原生 Responses 请求会在本地兼容以下能力：
 - `@README.md` / `@path/file` 形式的文件引用。
 - `exec_command` 文件读取类工具调用。
 - `apply_patch` 自定义工具调用；工具名带命名空间时也会按客户端声明名返回，便于兼容不同客户端的工具声明方式。
+- 常见 `input` / `output` item 的格式转换。
+- 工具调用结果回传与上游响应合并。
 
 ### 兼容客户端配置
 
@@ -344,6 +381,16 @@ sticky:
 
 账号级代理会覆盖全局代理配置，适合多账号分流。
 
+### 配置优先级
+
+通常建议按以下顺序管理配置：
+
+1. 默认配置文件。
+2. Docker Compose 或运行环境中的环境变量。
+3. 管理台中可维护的运行时数据，例如账号、API Key、模型启停和代理覆盖。
+
+生产环境不要直接使用示例密码、示例 API Key 或默认 SQLite 文件路径。
+
 ## 项目结构
 
 ```text
@@ -397,7 +444,150 @@ pnpm build
 
 如使用 npm，也可以执行 `npm install`、`npm run typecheck`、`npm run build`。
 
+建议提交前至少执行：
+
+```bash
+cd backend
+go test ./...
+
+cd ../frontend
+pnpm typecheck
+pnpm build
+```
+
 ## 生产部署建议
+
+生产环境建议重点关注以下事项：
+
+### 账号与密钥
+
+- 不要使用示例管理员密码 `change-me-please`。
+- 不要在公开仓库提交真实 `token_v2`、Cookie、API Key 或管理员 Token。
+- 首次启动后立即修改管理员密码。
+- 为不同调用方创建不同 API Key，便于额度控制和审计。
+- 定期轮换 API Key 和 Notion 账号凭据。
+
+### 网络与代理
+
+- 推荐将服务部署在可信内网或通过反向代理暴露。
+- 对外暴露时建议启用 HTTPS。
+- 如果 Notion 上游访问不稳定，可配置全局代理或账号级代理。
+- 多账号场景下可以使用账号级代理做出口隔离。
+
+### 数据库
+
+- 轻量部署可使用 SQLite。
+- 多实例、高并发或长期生产使用建议切换 PostgreSQL。
+- 定期备份数据库文件或 PostgreSQL 数据。
+- SQLite 部署时请确保数据目录已持久化挂载。
+
+### 日志与审计
+
+- 根据实际隐私要求配置请求日志保留策略。
+- 避免在日志中长期保存敏感业务内容。
+- 关注失败率、耗时、账号状态和额度消耗。
+
+### 多实例部署
+
+如果需要多实例部署：
+
+- 建议使用 PostgreSQL 作为共享数据库。
+- 如启用粘性会话，建议使用 Redis 存储粘性绑定。
+- 反向代理层应合理配置超时时间，避免流式响应被提前中断。
+
+## 路线图
+
+- [ ] 更完善的 Responses 持久化与查询能力。
+- [ ] 更细粒度的模型映射配置。
+- [ ] 更完善的账号健康检查和自动熔断策略。
+- [ ] 更丰富的用量报表和导出能力。
+- [ ] 支持更多 OpenAI 兼容客户端的边缘字段。
+- [ ] 提供更完整的部署示例和迁移文档。
+
+## 贡献说明
+
+欢迎提交 Issue 和 Pull Request。
+
+建议贡献流程：
+
+1. Fork 本仓库。
+2. 创建功能分支。
+3. 完成代码、测试和文档更新。
+4. 提交 Pull Request，并说明变更动机、主要实现和验证方式。
+
+提交前请尽量保证：
+
+- 后端测试通过：`go test ./...`
+- 前端类型检查通过：`pnpm typecheck`
+- 前端构建通过：`pnpm build`
+- README 或 docs 已同步更新相关用法变化。
+
+## 常见问题
+
+### 1. 调用 `/v1/chat/completions` 没有真实 Notion AI 回复？
+
+请检查管理台中是否已有可用 Notion 账号，并确认账号已激活且 Cookie / `token_v2` 有效。
+
+如果账号没有配置有效凭据，服务可能只能完成本地请求转换，无法真正请求 Notion AI 上游。
+
+### 2. 为什么返回 401？
+
+通常是 API Key 缺失、已禁用、已过期或额度不足。请检查请求头：
+
+```http
+Authorization: Bearer <api_key>
+```
+
+并在管理台确认该 Key 状态正常。
+
+### 3. Docker Compose 启动后打不开管理台？
+
+请检查：
+
+- 前端端口是否为 `8080`。
+- 后端是否通过 `http://127.0.0.1:9998/healthz` 正常响应。
+- 容器是否正常运行：`docker compose ps`。
+- 前端 Nginx 是否能反向代理 `/api/*` 到后端容器。
+
+### 4. 如何切换到 PostgreSQL？
+
+启动 PostgreSQL profile，并设置：
+
+```bash
+N2A_DATABASE_DRIVER=postgres
+N2A_DATABASE_DSN='host=postgres user=notion2api password=change-me dbname=notion2api port=5432 sslmode=disable TimeZone=Asia/Shanghai'
+```
+
+然后重新启动后端服务。
+
+### 5. 流式响应中断怎么办？
+
+请检查反向代理、网关或客户端的超时配置。流式响应需要较长连接时间，生产环境建议调大 read timeout / proxy timeout。
+
+### 6. 可以直接把服务暴露到公网吗？
+
+不建议裸露部署。至少应配置：
+
+- HTTPS
+- 强管理员密码
+- 独立 API Key
+- 访问控制或反向代理鉴权
+- 日志与备份策略
+
+## 风险与免责声明
+
+本项目用于学习、研究和自托管集成场景。使用前请自行确认是否符合 Notion 及相关服务的使用条款。
+
+请注意：
+
+- Notion 上游协议可能变化，可能导致部分功能失效。
+- Cookie、`token_v2`、API Key 属于敏感凭据，请妥善保管。
+- 不建议将真实凭据提交到公开仓库、镜像或日志系统。
+- 使用本项目产生的账号风险、数据风险和合规风险由使用者自行承担。
+
+## License
+
+请根据仓库实际许可证补充本节内容。
 
 - 修改默认管理员密码，不要使用示例密码。
 - 使用管理台创建正式 API Key，不要长期使用 bootstrap Key。
