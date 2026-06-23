@@ -1,9 +1,0 @@
-model_list:
-  - model_name: gpt-5.5
-    litellm_params:
-      model: openai/gpt-5.5
-      api_base: http://host.docker.internal:9998/v1
-      api_key: n2a_MXSEbIG0pFiwJ4PWkxs4yMkZGOvIVKN9LzgFa17UFyI
-
-general_settings:
-  master_key: n2a_MXSEbIG0pFiwJ4PWkxs4yMkZGOvIVKN9LzgFa17UFyI
