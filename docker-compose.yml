@@ -21,8 +21,8 @@ services:
 
   frontend:
     build:
-      context: .
-      dockerfile: frontend/Dockerfile
+      context: ./frontend
+      dockerfile: Dockerfile
       args:
         VITE_API_BASE_URL: ${N2A_FRONTEND_API_BASE_URL:-/api}
     container_name: notion2api-frontend
