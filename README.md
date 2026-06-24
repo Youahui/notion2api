@@ -4,6 +4,7 @@
 [![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=111)](https://react.dev/)
 [![Database](https://img.shields.io/badge/Database-SQLite%20%7C%20PostgreSQL-336791)](https://www.postgresql.org/)
 [![API](https://img.shields.io/badge/API-OpenAI%20Compatible-111827)](#api-用法)
+[![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](#开源协议)
 
 Notion2API 是一个基于 Go 的 Notion AI OpenAI / Codex 兼容桥接服务。它把 Notion AI 的上游协议封装成常见的 `/v1/models`、`/v1/chat/completions`、`/v1/responses` 接口，并提供 Web 管理台用于维护 Notion 账号池、API Key、模型、请求日志和用量统计。
 
@@ -19,6 +20,7 @@ Notion2API 是一个基于 Go 的 Notion AI OpenAI / Codex 兼容桥接服务。
 - [快速开始](#快速开始)
 - [首次配置流程](#首次配置流程)
 - [接口一览](#接口一览)
+- [账号组与调度](#账号组与调度)
 - [API 用法](#api-用法)
 - [管理台](#管理台)
 - [配置说明](#配置说明)
@@ -29,6 +31,7 @@ Notion2API 是一个基于 Go 的 Notion AI OpenAI / Codex 兼容桥接服务。
 - [贡献说明](#贡献说明)
 - [常见问题](#常见问题)
 - [风险与免责声明](#风险与免责声明)
+- [开源协议](#开源协议)
 
 ## 功能特性
 
@@ -126,7 +129,7 @@ VITE_API_BASE_URL=http://127.0.0.1:9998 pnpm dev
 Docker Compose 默认同时启动后端和管理台前端：
 
 - 后端 API：宿主机 `9998` -> 容器 `9998`
-- 前端管理台：宿主机 `8080` -> Nginx 容器 `80`
+- 前端管理台：宿主机 `5173` -> Nginx 容器 `80`
 - 前端容器会把 `/api/*` 反向代理到后端 `backend:9998`
 - 默认使用 SQLite，并把运行数据持久化到挂载的数据目录。
 
@@ -161,8 +164,16 @@ docker compose up -d --build backend
 
 ### 方式三：仅构建镜像
 
+根目录 `Dockerfile` 构建的是后端镜像：
+
 ```bash
-docker build -t notion2api:latest .
+docker build -t notion2api-backend:latest .
+```
+
+前端管理台镜像使用 `frontend/Dockerfile`：
+
+```bash
+docker build -t notion2api-admin:latest ./frontend
 ```
 
 运行时请根据实际环境挂载配置文件或通过环境变量覆盖配置。
@@ -191,7 +202,9 @@ docker build -t notion2api:latest .
 | `GET` | `/v1/models/:id` | API Key | 查询单个模型。 |
 | `POST` | `/v1/chat/completions` | API Key | OpenAI Chat Completions。 |
 | `POST` | `/v1/responses` | API Key | OpenAI Responses。 |
-| `GET` | `/v1/responses/:id` | API Key | 响应查询接口；如未启用响应持久化，可能返回未实现或未找到。 |
+| `GET` | `/v1/responses/:id` | API Key | 查询已持久化的 Responses 响应；未启用持久化或已过期时返回未找到。 |
+| `DELETE` | `/v1/responses/:id` | API Key | 删除已持久化的 Responses 响应。 |
+| `GET` | `/v1/responses/:id/input_items` | API Key | 分页读取 Responses 输入项。 |
 
 ### 管理接口
 
@@ -201,13 +214,107 @@ docker build -t notion2api:latest .
 | 管理员 | `/admin/admins` | 管理员列表、新增、更新和删除。 |
 | API Key | `/admin/api-keys` | API Key 创建、启停、删除、额度和单 Key 用量。 |
 | 账号 | `/admin/accounts` | Notion 账号新增、导入、登录、工作区/空间、激活、测试和代理配置。 |
+| 账号组 | `/admin/groups` | 账号组创建、更新、删除和成员维护；API Key 可绑定账号组。 |
 | 模型 | `/admin/models` | 查看公开模型、启停状态和 Notion 内部模型映射。 |
 | 会话 | `/admin/notion-conversations` | Notion 远端 AI 会话列表、详情和删除。 |
 | 用量日志 | `/admin/usage`、`/admin/logs` | token 估算用量和请求日志。 |
+| 设置 | `/admin/settings` | 设置页接口预留。 |
 
 管理接口除 `/admin/login` 外，都支持通过 `X-Admin-Token`、`Authorization: Bearer <token>` 或登录 Cookie 鉴权。
 
 `GET /admin/notion-conversations` 支持 `account_id`、`space_id`、`page`、`page_size` 查询参数；兼容旧的 `limit` 参数作为第一页页大小。
+
+## 账号组与调度
+
+账号组用于把 Notion 账号池拆分成多个可调度范围，并把 API Key 限制在指定账号组内。典型用法是为不同团队、项目或出口代理维护独立账号池。
+
+核心规则：
+
+- 服务启动时会确保存在启用状态的默认组 `default`。没有分组的账号和 API Key 会被归入默认组。
+- 默认组不能停用或删除；普通组删除后，该组成员关系会被删除，绑定到该组的 API Key 会自动转回默认组。
+- 一个账号可以属于多个组。新建账号时不传 `group_ids` 或传空数组会进入默认组；更新账号时省略 `group_ids` 会保留原分组，传空数组会重置到默认组。
+- 一个 API Key 只能绑定一个 `group_id`。创建或更新 API Key 时不传 `group_id` 会使用默认组；不能绑定已禁用的组。
+- `/v1/*` 请求鉴权成功后，只会从当前 API Key 绑定的账号组里选择账号；已禁用的组成员不会参与调度。
+- 组成员的 `priority` 会优先影响组内调度顺序，然后再参考账号自身的激活状态、账号优先级和最近使用时间。
+- `PUT /admin/groups/:id/accounts` 是替换式更新，只保留请求体 `members` 中列出的成员。
+
+### 账号组接口示例
+
+以下示例使用管理 token：
+
+```bash
+export ADMIN_TOKEN='<admin_token>'
+```
+
+列出账号组：
+
+```bash
+curl http://127.0.0.1:9998/admin/groups \
+  -H "Authorization: Bearer ${ADMIN_TOKEN}"
+```
+
+创建账号组：
+
+```bash
+curl http://127.0.0.1:9998/admin/groups \
+  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "team-a",
+    "description": "Team A account pool",
+    "enabled": true
+  }'
+```
+
+替换组成员：
+
+```bash
+curl -X PUT http://127.0.0.1:9998/admin/groups/2/accounts \
+  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "members": [
+      {"account_id": 1, "enabled": true, "priority": 100},
+      {"account_id": 2, "enabled": false, "priority": 50}
+    ]
+  }'
+```
+
+给账号绑定分组。账号更新接口当前需要带上 `email`：
+
+```bash
+curl -X PUT http://127.0.0.1:9998/admin/accounts/1 \
+  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "email": "user@example.com",
+    "group_ids": [2]
+  }'
+```
+
+创建绑定到指定账号组的 API Key：
+
+```bash
+curl http://127.0.0.1:9998/admin/api-keys \
+  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "team-a-key",
+    "group_id": 2,
+    "enabled": true,
+    "token_quota_total": 0,
+    "token_quota_daily": 0
+  }'
+```
+
+调整已有 API Key 的账号组：
+
+```bash
+curl -X PUT http://127.0.0.1:9998/admin/api-keys/3 \
+  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -d '{"group_id": 2}'
+```
 
 ## API 用法
 
@@ -314,8 +421,10 @@ API Key 可绑定一个账号组。请求鉴权后，服务只会在该 Key 绑�
 - 管理员：管理员账号创建、更新、启停。
 - API Keys：创建和管理可分发 API Key，查看额度和用量。
 - 账号池：Notion 账号登录、手工导入、账号组、激活、测试、空间查看。
+- 账号组：维护账号分组，并用于限制 API Key 的可调度账号范围。
 - 模型：查看当前公开模型和对应 Notion 内部模型。
 - 会话：读取和删除 Notion 远端 AI 会话。
+- 设置：运行设置入口，目前后端接口为预留状态。
 - 请求测试：在管理台内发起测试请求。
 - 请求日志和用量：查看调用记录、耗时和 token 估算。
 
@@ -339,23 +448,54 @@ security:
     username: admin
     password: change-me-please
   bootstrap_api_key: "<api_key>"
+  api_key_prefix: "n2a"
 
 database:
   driver: sqlite
   dsn: data/notion2api.sqlite
+  max_idle_conns: 5
+  max_open_conns: 20
+  conn_max_lifetime_seconds: 3600
 
 upstream:
   base_url: https://www.notion.so
   origin: https://www.notion.so
   timeout_seconds: 180
+  poll_interval_seconds: 1.5
+  poll_max_rounds: 40
 
 proxy:
   mode: off
   url: ""
+  http_url: ""
+  https_url: ""
+
+features:
+  web_search: true
+  generate_image: true
+  csv_attachment: true
+  fresh_thread_per_request: true
+  preserve_system_messages_as_steps: false
+
+dispatch:
+  probe_cache_ttl_seconds: 60
 
 sticky:
   enabled: true
   ttl_seconds: 604800
+  local_enabled: true
+  redis_url: ""
+  redis_key_prefix: "n2a:sticky:thread:"
+  redis_timeout_seconds: 2
+
+storage:
+  persist_conversations: true
+  persist_responses: true
+  response_ttl_seconds: 3600
+
+login_helper:
+  sessions_dir: data/notion_accounts
+  timeout_sec: 120
 ```
 
 支持的环境变量覆盖：
@@ -366,14 +506,27 @@ sticky:
 | `N2A_BOOTSTRAP_ADMIN_USERNAME` / `N2A_BOOTSTRAP_ADMIN_PASSWORD` | 首次初始化管理员。 |
 | `N2A_BOOTSTRAP_API_KEY` | 首次初始化 API Key；为空则不自动创建。 |
 | `N2A_ADMIN_TOKEN_TTL_HOURS` | 管理员登录 token 有效期。 |
+| `N2A_API_KEY_PREFIX` | 新建 API Key 的默认前缀。 |
 | `N2A_DATABASE_DRIVER` / `N2A_DATABASE_DSN` | 数据库类型和连接串。 |
 | `N2A_PROXY_MODE` / `N2A_PROXY_URL` | 全局上游代理。 |
 | `N2A_PROXY_HTTP_URL` / `N2A_PROXY_HTTPS_URL` | 分协议代理地址。 |
+| `N2A_DISPATCH_PROBE_CACHE_TTL_SECONDS` | 账号探测缓存时间。 |
 | `N2A_STICKY_ENABLED` / `N2A_STICKY_TTL_SECONDS` | 粘性会话开关和有效期。 |
+| `N2A_STICKY_LOCAL_ENABLED` | 是否启用本地内存粘性会话存储。 |
 | `N2A_STICKY_REDIS_URL` | 可选 Redis 粘性会话存储。 |
+| `N2A_STICKY_REDIS_KEY_PREFIX` | Redis 粘性会话键前缀。 |
+| `N2A_STICKY_REDIS_TIMEOUT_SECONDS` | Redis 粘性会话操作超时时间。 |
 | `N2A_LOGIN_HELPER_SESSIONS_DIR` | Notion 登录会话文件目录。 |
 | `N2A_LOGIN_HELPER_TIMEOUT_SEC` | 邮箱验证码登录有效期。 |
 | `VITE_API_BASE_URL` | 前端开发服务访问后端 API 的基础地址。 |
+
+Docker Compose 还会读取以下变量用于端口和前端构建：
+
+| 变量 | 说明 |
+| --- | --- |
+| `N2A_PORT` | 后端宿主机映射端口，默认 `9998`。 |
+| `N2A_FRONTEND_PORT` | 前端宿主机映射端口，默认 `5173`。 |
+| `N2A_FRONTEND_API_BASE_URL` | 前端镜像构建时使用的 API 基础地址，默认 `/api`。 |
 
 代理模式：
 
@@ -548,7 +701,7 @@ Authorization: Bearer <api_key>
 
 请检查：
 
-- 前端端口是否为 `8080`。
+- 前端端口是否为 `5173`，或是否已通过 `N2A_FRONTEND_PORT` 修改。
 - 后端是否通过 `http://127.0.0.1:9998/healthz` 正常响应。
 - 容器是否正常运行：`docker compose ps`。
 - 前端 Nginx 是否能反向代理 `/api/*` 到后端容器。
@@ -580,7 +733,7 @@ N2A_DATABASE_DSN='host=postgres user=notion2api password=change-me dbname=notion
 
 ## 风险与免责声明
 
-本项目用于学习、研究和自托管集成场景。使用前请自行确认是否符合 Notion 及相关服务的使用条款。
+本项目用于学习、研究和自托管集成场景，依赖 Notion 的非官方 Web 接口。使用前请自行确认是否符合 Notion 及相关服务的使用条款。
 
 请注意：
 
@@ -589,62 +742,10 @@ N2A_DATABASE_DSN='host=postgres user=notion2api password=change-me dbname=notion
 - 不建议将真实凭据提交到公开仓库、镜像或日志系统。
 - 使用本项目产生的账号风险、数据风险和合规风险由使用者自行承担。
 
-## License
-
-请根据仓库实际许可证补充本节内容。
-
-- 修改默认管理员密码，不要使用示例密码。
-- 使用管理台创建正式 API Key，不要长期使用 bootstrap Key。
-- 将 `data/` 挂载到持久化磁盘，并做好备份。
-- 通过反向代理暴露服务时启用 HTTPS。
-- 限制 `/admin` 访问来源，必要时加一层 IP 白名单或额外认证。
-- 定期检查 Notion 账号登录态、失败次数和上游错误。
-- 准备开源或公开部署前，不要提交数据库、Cookie、token、日志和本地会话文件。
-
-## 路线图
-
-- 完善 `/v1/responses/:id` 响应查询、响应持久化和 TTL 清理。
-- 持续增强 Codex Responses 工具协议兼容性。
-- 增强模型管理能力，支持后台启停和调整模型映射。
-- 补充更多账号调度、粘性会话和 Notion 网关测试。
-- 增加更细粒度的运行指标、错误审计和部署示例。
-
-## 贡献说明
-
-欢迎提交 Issue 和 Pull Request。建议贡献前先确认：
-
-- 变更范围聚焦，避免无关格式化。
-- 不提交真实 Notion Cookie、`token_v2`、API Key、数据库和日志。
-- 后端变更尽量运行 `go test ./...`。
-- 前端变更尽量运行 `pnpm typecheck` 和 `pnpm build`。
-- 新增配置、接口或部署方式时同步更新 README 或 `docs/`。
-
-## 常见问题
-
-### 管理台请求失败
-
-确认前端 `VITE_API_BASE_URL` 指向后端地址。本地示例配置和 Docker 默认地址都是 `http://127.0.0.1:9998`。
-
-### `/v1/*` 返回 401
-
-检查请求头是否包含 `Authorization: Bearer <api_key>`，并确认 API Key 未禁用、未过期、未超出额度。
-
-### 上游返回 403 或账号不可用
-
-Notion 登录态可能过期，或账号空间信息不完整。到管理台账号页面重新登录、手工导入 Cookie，或执行账号测试查看错误。
-
-### 响应里显示 converted successfully
-
-这通常表示账号缺少 `auth_token` 或 Cookie，服务只完成了 Notion 请求 payload 转换，没有真正调用上游。
-
-### PostgreSQL 连接失败
-
-确认 `database.driver=postgres`，并检查 DSN 中的 host、port、user、password、dbname 是否与实际 PostgreSQL 服务一致。
-
-## 风险与免责声明
-
-本项目依赖 Notion 的非官方 Web 接口，接口字段、鉴权方式和风控策略可能随 Notion 更新而变化。请仅在你有权使用的账号和空间内使用本项目，并自行承担账号安全、数据安全、调用频率和服务可用性风险。
-
 ## 开源协议
 
-当前仓库尚未包含 `LICENSE` 文件。正式开源前建议补充明确的开源协议，例如 MIT 或 Apache-2.0。
+本项目采用 Apache License 2.0 开源协议。
+
+在遵守协议条款的前提下，你可以自由使用、复制、修改、分发和商用本项目。分发本项目或其修改版本时，请保留版权声明、许可证文本和必要的变更说明。
+
+Apache-2.0 不强制要求修改版开源，但包含明确的专利授权、免责声明和商标不授权条款。完整协议内容请以仓库根目录 `LICENSE` 文件为准；正式公开前请补充该文件，并确认所有第三方代码和依赖许可证兼容。
