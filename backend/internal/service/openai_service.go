@@ -1280,6 +1280,10 @@ func isAccountFailoverError(err error) bool {
 	if isSessionRetryableError(err) {
 		return true
 	}
+	var stepErr *NotionInferenceStepError
+	if errors.As(err, &stepErr) {
+		return stepErr.Retryable || strings.EqualFold(strings.TrimSpace(stepErr.SubType), "premium-feature-unavailable")
+	}
 	var apiErr *NotionAPIError
 	if errors.As(err, &apiErr) {
 		return apiErr.StatusCode == 429 || apiErr.StatusCode >= 500

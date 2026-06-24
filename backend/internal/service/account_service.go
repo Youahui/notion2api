@@ -170,24 +170,16 @@ func (s *AccountService) SelectWithScope(ctx context.Context, opts AccountSelect
 		}
 		return model.Account{}, ErrNotFound
 	}
-	account, err := s.store.FindActiveAccount(ctx)
-	if err == nil && s.accountSchedulable(account, opts) {
-		return account, nil
-	}
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		return model.Account{}, err
-	}
-	account, err = s.store.FindBestAccount(ctx)
+	accounts, err := s.store.ListSchedulableAccounts(ctx)
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return model.Account{}, ErrNotFound
-		}
 		return model.Account{}, err
 	}
-	if !s.accountSchedulable(account, opts) {
-		return model.Account{}, ErrNotFound
+	for _, account := range accounts {
+		if s.accountSchedulable(account, opts) {
+			return account, nil
+		}
 	}
-	return account, nil
+	return model.Account{}, ErrNotFound
 }
 
 func (s *AccountService) AccountSchedulableInScope(ctx context.Context, account model.Account, opts AccountSelectionOptions) (bool, error) {

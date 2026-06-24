@@ -149,7 +149,7 @@ func (s *Store) ReplaceAccountGroupMembers(ctx context.Context, groupID uint, me
 		for idx := range members {
 			members[idx].ID = 0
 			members[idx].GroupID = groupID
-			if err := tx.Create(&members[idx]).Error; err != nil {
+			if err := createAccountGroupMember(tx, members[idx]); err != nil {
 				return err
 			}
 		}
@@ -165,12 +165,24 @@ func (s *Store) ReplaceAccountGroupBindings(ctx context.Context, accountID uint,
 		for idx := range members {
 			members[idx].ID = 0
 			members[idx].AccountID = accountID
-			if err := tx.Create(&members[idx]).Error; err != nil {
+			if err := createAccountGroupMember(tx, members[idx]); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
+}
+
+func createAccountGroupMember(tx *gorm.DB, member model.AccountGroupMember) error {
+	now := time.Now()
+	return tx.Model(&model.AccountGroupMember{}).Create(map[string]any{
+		"group_id":   member.GroupID,
+		"account_id": member.AccountID,
+		"enabled":    member.Enabled,
+		"priority":   member.Priority,
+		"created_at": now,
+		"updated_at": now,
+	}).Error
 }
 
 func (s *Store) DeleteAccountGroupBindings(ctx context.Context, accountID uint) error {
@@ -464,6 +476,15 @@ func (s *Store) ListSchedulableAccountsByGroup(ctx context.Context, groupID uint
 		Where("account_group_members.group_id = ? AND account_group_members.enabled = ?", groupID, true).
 		Where("accounts.enabled = ?", true).
 		Order("account_group_members.priority desc, accounts.active desc, accounts.priority desc, accounts.last_used_at asc, accounts.id asc").
+		Find(&rows).Error
+	return rows, err
+}
+
+func (s *Store) ListSchedulableAccounts(ctx context.Context) ([]model.Account, error) {
+	var rows []model.Account
+	err := s.db.WithContext(ctx).Model(&model.Account{}).
+		Where("enabled = ?", true).
+		Order("active desc, priority desc, last_used_at asc, id asc").
 		Find(&rows).Error
 	return rows, err
 }

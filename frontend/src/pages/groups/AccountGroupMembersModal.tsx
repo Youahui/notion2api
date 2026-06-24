@@ -29,6 +29,18 @@ function cloneMembers(rows: GroupMember[]) {
   return rows.map((row) => ({ ...row }));
 }
 
+function sameAccountID(left: number, right: number) {
+  return String(left) === String(right);
+}
+
+function accountOptionLabel(account: Account) {
+  return [account.email, account.user_name].filter(Boolean).join(' · ');
+}
+
+function accountSearchText(account: Account) {
+  return [account.email, account.user_name, account.user_id].filter(Boolean).join(' ').toLowerCase();
+}
+
 function fmtTime(value?: string | null) {
   if (!value) return '-';
   const date = new Date(value);
@@ -56,8 +68,8 @@ export function AccountGroupMembersModal({ open, group, onCancel, onSaved }: Acc
 
   const membersDirty = useMemo(() => !isSameMembers(originalMembers, memberDraftList), [memberDraftList, originalMembers]);
   const availableAccounts = useMemo(() => {
-    const joinedIds = new Set(memberDraftList.map((item) => item.account_id));
-    return allAccounts.filter((account) => !joinedIds.has(account.id));
+    const joinedIds = new Set(memberDraftList.map((item) => String(item.account_id)));
+    return allAccounts.filter((account) => !joinedIds.has(String(account.id)));
   }, [allAccounts, memberDraftList]);
 
   const loadMemberData = async (targetGroup: Group) => {
@@ -103,8 +115,8 @@ export function AccountGroupMembersModal({ open, group, onCancel, onSaved }: Acc
   };
 
   const handleAddMember = () => {
-    if (!selectedAccountId || memberDraftList.some((member) => member.account_id === selectedAccountId)) return;
-    const account = allAccounts.find((row) => row.id === selectedAccountId);
+    if (!selectedAccountId || memberDraftList.some((member) => sameAccountID(member.account_id, selectedAccountId))) return;
+    const account = allAccounts.find((row) => sameAccountID(row.id, selectedAccountId));
     if (!account) return;
     const nextList = [
       ...memberDraftList,
@@ -123,18 +135,18 @@ export function AccountGroupMembersModal({ open, group, onCancel, onSaved }: Acc
   };
 
   const handleRemoveMember = (accountID: number) => {
-    const nextList = memberDraftList.filter((member) => member.account_id !== accountID);
+    const nextList = memberDraftList.filter((member) => !sameAccountID(member.account_id, accountID));
     setMemberDraftList(nextList);
     setMemberPage((current) => Math.min(current, Math.max(1, Math.ceil(nextList.length / memberPageSize))));
   };
 
   const handleMemberEnabledChange = (accountID: number, enabled: boolean) => {
-    setMemberDraftList((current) => current.map((member) => (member.account_id === accountID ? { ...member, enabled } : member)));
+    setMemberDraftList((current) => current.map((member) => (sameAccountID(member.account_id, accountID) ? { ...member, enabled } : member)));
   };
 
   const handleMemberPriorityChange = (accountID: number, priority: number | null) => {
     setMemberDraftList((current) =>
-      current.map((member) => (member.account_id === accountID ? { ...member, priority: Number(priority ?? 0) } : member))
+      current.map((member) => (sameAccountID(member.account_id, accountID) ? { ...member, priority: Number(priority ?? 0) } : member))
     );
   };
 
@@ -150,7 +162,7 @@ export function AccountGroupMembersModal({ open, group, onCancel, onSaved }: Acc
     try {
       const payload = memberDraftList.map((member) => ({
         account_id: member.account_id,
-        enabled: member.enabled,
+        enabled: Boolean(member.enabled),
         priority: member.priority ?? 0
       }));
       const res = await adminApi.updateGroupMembers(group.id, payload);
@@ -195,15 +207,18 @@ export function AccountGroupMembersModal({ open, group, onCancel, onSaved }: Acc
           </Typography.Title>
           <Space.Compact className="groups-add-member-row">
             <Select
+              showSearch
               value={selectedAccountId}
               disabled={!availableAccounts.length}
               loading={loading}
               placeholder={availableAccounts.length ? '请选择要加入的账号' : '暂无可添加账号'}
-              optionFilterProp="label"
+              optionFilterProp="searchText"
+              filterOption={(input, option) => String(option?.searchText ?? '').includes(input.trim().toLowerCase())}
               onChange={setSelectedAccountId}
               options={availableAccounts.map((account) => ({
                 value: account.id,
-                label: `${account.email}${account.enabled ? '' : '（账号已禁用）'}`
+                label: `${accountOptionLabel(account)}${account.enabled ? '' : '（账号已禁用）'}`,
+                searchText: accountSearchText(account)
               }))}
             />
             <Button type="primary" disabled={!selectedAccountId} onClick={handleAddMember}>
@@ -242,8 +257,8 @@ export function AccountGroupMembersModal({ open, group, onCancel, onSaved }: Acc
               title: '组内启用',
               dataIndex: 'enabled',
               width: 110,
-              render: (enabled: boolean, row) => (
-                <Switch size="small" checked={enabled} onChange={(checked) => handleMemberEnabledChange(row.account_id, checked)} />
+              render: (_: boolean, row) => (
+                <Switch size="small" checked={Boolean(row.enabled)} onChange={(checked) => handleMemberEnabledChange(row.account_id, checked)} />
               )
             },
             {
