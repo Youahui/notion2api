@@ -12,10 +12,13 @@ export interface ApiKey {
   id: number;
   name: string;
   api_key: string;
+  api_key_masked?: string;
   key_prefix: string;
   key_suffix: string;
   enabled: boolean;
   owner_admin_id?: number | null;
+  group_id?: number | null;
+  group_name?: string;
   expires_at?: string | null;
   last_used_at?: string | null;
   token_quota_total: number;
@@ -75,9 +78,30 @@ export interface RequestLog {
   created_at: string;
 }
 
+export interface Group {
+  id: number;
+  name: string;
+  description: string;
+  enabled: boolean;
+  is_default: boolean;
+  account_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GroupMember {
+  account_id: number;
+  email: string;
+  enabled: boolean;
+  priority: number;
+  status: string;
+  last_used_at?: string | null;
+}
+
 export interface Account {
   id: number;
   email: string;
+  groups?: Group[];
   enabled: boolean;
   active: boolean;
   user_id: string;
@@ -132,6 +156,7 @@ export interface AccountSpace {
 
 export interface AccountPayload {
   email: string;
+  group_ids?: number[];
   enabled?: boolean;
   active?: boolean;
   user_id?: string;
@@ -252,6 +277,13 @@ export interface NotionConversationDetail extends NotionConversationSummary {
 
 export interface ListResponse<T> {
   data: T[];
+}
+
+export interface PaginatedListResponse<T> extends ListResponse<T> {
+  page: number;
+  page_size: number;
+  total: number;
+  has_more: boolean;
 }
 
 export interface LoginResponse {

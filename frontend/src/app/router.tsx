@@ -5,6 +5,7 @@ import { DashboardPage } from '../pages/dashboard/DashboardPage';
 import { AdminsPage } from '../pages/admins/AdminsPage';
 import { ApiKeysPage } from '../pages/api-keys/ApiKeysPage';
 import { AccountsPage } from '../pages/accounts/AccountsPage';
+import { GroupsPage } from '../pages/groups/GroupsPage';
 import { ModelsPage } from '../pages/models/ModelsPage';
 import { ConversationsPage } from '../pages/conversations/ConversationsPage';
 import { SettingsPage } from '../pages/settings/SettingsPage';
@@ -24,6 +25,7 @@ export const router = createBrowserRouter([
       { path: 'api-keys', element: <ApiKeysPage /> },
       { path: 'accounts', element: <Navigate to="/admin/accounts/list" replace /> },
       { path: 'accounts/:tab', element: <AccountsPage /> },
+      { path: 'groups', element: <GroupsPage /> },
       { path: 'models', element: <ModelsPage /> },
       { path: 'conversations', element: <ConversationsPage /> },
       { path: 'settings', element: <SettingsPage /> },

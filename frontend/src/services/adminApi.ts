@@ -8,6 +8,8 @@ import type {
   AccountPayload,
   ApiKey,
   CreatedApiKey,
+  Group,
+  GroupMember,
   HealthResponse,
   ListResponse,
   LoginResponse,
@@ -15,6 +17,7 @@ import type {
   ModelRow,
   NotionConversationDetail,
   NotionConversationSummary,
+  PaginatedListResponse,
   RequestLog,
   UsageRow
 } from '../types/api';
@@ -66,11 +69,11 @@ export const adminApi = {
     return request<ListResponse<ApiKey>>('/admin/api-keys');
   },
 
-  createApiKey(payload: { name: string; enabled?: boolean; token_quota_total?: number; token_quota_daily?: number; expires_at?: string }) {
+  createApiKey(payload: { name: string; enabled?: boolean; group_id?: number; token_quota_total?: number; token_quota_daily?: number; expires_at?: string }) {
     return request<CreatedApiKey>('/admin/api-keys', { method: 'POST', body: jsonBody(payload) });
   },
 
-  updateApiKey(id: number, payload: { name?: string; token_quota_total?: number; token_quota_daily?: number; expires_at?: string | null }) {
+  updateApiKey(id: number, payload: { name?: string; group_id?: number; token_quota_total?: number; token_quota_daily?: number; expires_at?: string | null }) {
     return request<ApiKey>(`/admin/api-keys/${id}`, { method: 'PUT', body: jsonBody(payload) });
   },
 
@@ -84,6 +87,30 @@ export const adminApi = {
 
   deleteApiKey(id: number) {
     return request<{ ok: boolean }>(`/admin/api-keys/${id}`, { method: 'DELETE' });
+  },
+
+  groups() {
+    return request<ListResponse<Group>>('/admin/groups');
+  },
+
+  createGroup(payload: { name: string; description?: string; enabled?: boolean }) {
+    return request<Group>('/admin/groups', { method: 'POST', body: jsonBody(payload) });
+  },
+
+  updateGroup(id: number, payload: { name?: string; description?: string; enabled?: boolean }) {
+    return request<Group>(`/admin/groups/${id}`, { method: 'PUT', body: jsonBody(payload) });
+  },
+
+  deleteGroup(id: number) {
+    return request<{ ok: boolean }>(`/admin/groups/${id}`, { method: 'DELETE' });
+  },
+
+  groupMembers(id: number) {
+    return request<ListResponse<GroupMember>>(`/admin/groups/${id}/accounts`);
+  },
+
+  updateGroupMembers(id: number, members: Array<{ account_id: number; enabled: boolean; priority: number }>) {
+    return request<ListResponse<GroupMember>>(`/admin/groups/${id}/accounts`, { method: 'PUT', body: jsonBody({ members }) });
   },
 
   models() {
@@ -154,8 +181,8 @@ export const adminApi = {
     });
   },
 
-  notionConversations(params: { account_id: number; space_id: string; space_view_id?: string; space_name?: string; limit?: number }) {
-    return request<ListResponse<NotionConversationSummary>>(`/admin/notion-conversations${queryString(params)}`);
+  notionConversations(params: { account_id: number; space_id: string; space_view_id?: string; space_name?: string; page?: number; page_size?: number; limit?: number }) {
+    return request<PaginatedListResponse<NotionConversationSummary>>(`/admin/notion-conversations${queryString(params)}`);
   },
 
   notionConversation(threadID: string, params: { account_id: number; space_id: string; space_view_id?: string; space_name?: string }) {

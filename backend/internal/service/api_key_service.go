@@ -50,6 +50,10 @@ func (s *APIKeyService) SeedBootstrapAPIKey(ctx context.Context, secret string) 
 		return nil
 	}
 	prefix, suffix := security.APIKeyParts(secret)
+	groupID, err := s.resolveAPIKeyGroupID(ctx, nil)
+	if err != nil {
+		return err
+	}
 	return s.store.CreateAPIKey(ctx, &model.APIKey{
 		Name:      "bootstrap",
 		KeyHash:   security.HashSecret(secret),
@@ -57,6 +61,7 @@ func (s *APIKeyService) SeedBootstrapAPIKey(ctx context.Context, secret string) 
 		KeyPrefix: prefix,
 		KeySuffix: suffix,
 		Enabled:   true,
+		GroupID:   groupID,
 	})
 }
 
@@ -73,6 +78,10 @@ func (s *APIKeyService) Create(ctx context.Context, ownerAdminID uint, req dto.C
 	if req.Enabled != nil {
 		enabled = *req.Enabled
 	}
+	groupID, err := s.resolveAPIKeyGroupID(ctx, req.GroupID)
+	if err != nil {
+		return dto.CreateAPIKeyResponse{}, err
+	}
 	key := model.APIKey{
 		Name:            name,
 		KeyHash:         security.HashSecret(secret),
@@ -81,6 +90,7 @@ func (s *APIKeyService) Create(ctx context.Context, ownerAdminID uint, req dto.C
 		KeySuffix:       suffix,
 		Enabled:         enabled,
 		OwnerAdminID:    &ownerAdminID,
+		GroupID:         groupID,
 		ExpiresAt:       req.ExpiresAt,
 		TokenQuotaTotal: req.TokenQuotaTotal,
 		TokenQuotaDaily: req.TokenQuotaDaily,
@@ -96,9 +106,13 @@ func (s *APIKeyService) List(ctx context.Context) ([]dto.APIKeyDTO, error) {
 	if err != nil {
 		return nil, err
 	}
+	groupsByID, err := s.apiKeyGroups(ctx, keys)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]dto.APIKeyDTO, 0, len(keys))
 	for _, key := range keys {
-		out = append(out, APIKeyDTO(key))
+		out = append(out, APIKeyDTO(key, groupsByID))
 	}
 	return out, nil
 }
@@ -111,7 +125,11 @@ func (s *APIKeyService) Get(ctx context.Context, id uint) (dto.APIKeyDTO, error)
 		}
 		return dto.APIKeyDTO{}, err
 	}
-	return APIKeyDTO(key), nil
+	groupsByID, err := s.apiKeyGroups(ctx, []model.APIKey{key})
+	if err != nil {
+		return dto.APIKeyDTO{}, err
+	}
+	return APIKeyDTO(key, groupsByID), nil
 }
 
 func (s *APIKeyService) Update(ctx context.Context, id uint, req dto.UpdateAPIKeyRequest) (dto.APIKeyDTO, error) {
@@ -125,6 +143,13 @@ func (s *APIKeyService) Update(ctx context.Context, id uint, req dto.UpdateAPIKe
 	if req.Name != nil && strings.TrimSpace(*req.Name) != "" {
 		key.Name = strings.TrimSpace(*req.Name)
 	}
+	if req.GroupID != nil {
+		groupID, err := s.resolveAPIKeyGroupID(ctx, req.GroupID)
+		if err != nil {
+			return dto.APIKeyDTO{}, err
+		}
+		key.GroupID = groupID
+	}
 	if req.ExpiresAt != nil {
 		key.ExpiresAt = req.ExpiresAt
 	}
@@ -137,7 +162,11 @@ func (s *APIKeyService) Update(ctx context.Context, id uint, req dto.UpdateAPIKe
 	if err := s.store.SaveAPIKey(ctx, &key); err != nil {
 		return dto.APIKeyDTO{}, err
 	}
-	return APIKeyDTO(key), nil
+	groupsByID, err := s.apiKeyGroups(ctx, []model.APIKey{key})
+	if err != nil {
+		return dto.APIKeyDTO{}, err
+	}
+	return APIKeyDTO(key, groupsByID), nil
 }
 
 func (s *APIKeyService) SetEnabled(ctx context.Context, id uint, enabled bool) (dto.APIKeyDTO, error) {
@@ -152,7 +181,11 @@ func (s *APIKeyService) SetEnabled(ctx context.Context, id uint, enabled bool) (
 	if err := s.store.SaveAPIKey(ctx, &key); err != nil {
 		return dto.APIKeyDTO{}, err
 	}
-	return APIKeyDTO(key), nil
+	groupsByID, err := s.apiKeyGroups(ctx, []model.APIKey{key})
+	if err != nil {
+		return dto.APIKeyDTO{}, err
+	}
+	return APIKeyDTO(key, groupsByID), nil
 }
 
 func (s *APIKeyService) Delete(ctx context.Context, id uint) error {
@@ -197,6 +230,29 @@ func (s *APIKeyService) Authenticate(ctx context.Context, secret string) (model.
 			if usedToday >= key.TokenQuotaDaily {
 				return model.APIKey{}, ErrForbidden
 			}
+		}
+		if key.GroupID == nil {
+			groupID, err := s.resolveAPIKeyGroupID(ctx, nil)
+			if err != nil {
+				return model.APIKey{}, err
+			}
+			key.GroupID = groupID
+			if err := s.store.SaveAPIKey(ctx, &key); err != nil {
+				return model.APIKey{}, err
+			}
+		}
+		if key.GroupID == nil {
+			return model.APIKey{}, ErrForbidden
+		}
+		group, err := s.store.GetAccountGroup(ctx, *key.GroupID)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return model.APIKey{}, ErrForbidden
+			}
+			return model.APIKey{}, err
+		}
+		if !group.Enabled {
+			return model.APIKey{}, ErrForbidden
 		}
 		return key, nil
 	}
@@ -326,15 +382,75 @@ func (s *APIKeyService) apiKeysByRequestLogID(ctx context.Context, rows []model.
 	return out, nil
 }
 
-func APIKeyDTO(key model.APIKey) dto.APIKeyDTO {
+func (s *APIKeyService) resolveAPIKeyGroupID(ctx context.Context, requested *uint) (*uint, error) {
+	if requested != nil {
+		if *requested == 0 {
+			return nil, ErrInvalid
+		}
+		group, err := s.store.GetAccountGroup(ctx, *requested)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, ErrNotFound
+			}
+			return nil, err
+		}
+		if !group.Enabled {
+			return nil, ErrForbidden
+		}
+		return &group.ID, nil
+	}
+	group, err := s.store.GetDefaultAccountGroup(ctx)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		group, err = s.store.EnsureDefaultAccountGroup(ctx)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &group.ID, nil
+}
+
+func (s *APIKeyService) apiKeyGroups(ctx context.Context, keys []model.APIKey) (map[uint]model.AccountGroup, error) {
+	seen := map[uint]struct{}{}
+	ids := make([]uint, 0)
+	for _, key := range keys {
+		if key.GroupID == nil || *key.GroupID == 0 {
+			continue
+		}
+		if _, ok := seen[*key.GroupID]; ok {
+			continue
+		}
+		seen[*key.GroupID] = struct{}{}
+		ids = append(ids, *key.GroupID)
+	}
+	groups, err := s.store.FindAccountGroupsByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[uint]model.AccountGroup, len(groups))
+	for _, group := range groups {
+		out[group.ID] = group
+	}
+	return out, nil
+}
+
+func APIKeyDTO(key model.APIKey, groupsByID ...map[uint]model.AccountGroup) dto.APIKeyDTO {
+	groupName := ""
+	if key.GroupID != nil && len(groupsByID) > 0 {
+		if group, ok := groupsByID[0][*key.GroupID]; ok {
+			groupName = group.Name
+		}
+	}
 	return dto.APIKeyDTO{
 		ID:              key.ID,
 		Name:            key.Name,
 		APIKey:          key.APIKey,
+		APIKeyMasked:    maskedAPIKey(key),
 		KeyPrefix:       key.KeyPrefix,
 		KeySuffix:       key.KeySuffix,
 		Enabled:         key.Enabled,
 		OwnerAdminID:    key.OwnerAdminID,
+		GroupID:         key.GroupID,
+		GroupName:       groupName,
 		ExpiresAt:       key.ExpiresAt,
 		LastUsedAt:      key.LastUsedAt,
 		TokenQuotaTotal: key.TokenQuotaTotal,
@@ -348,18 +464,16 @@ func APIKeyDTO(key model.APIKey) dto.APIKeyDTO {
 
 func APIKeyUsageDTO(row model.APIKeyUsage, keysByID map[uint]model.APIKey) dto.APIKeyUsageDTO {
 	var keyName string
-	var keyValue string
 	var keyMasked string
 	if key, ok := keysByID[row.APIKeyID]; ok {
 		keyName = key.Name
-		keyValue = strings.TrimSpace(key.APIKey)
 		keyMasked = maskedAPIKey(key)
 	}
 	return dto.APIKeyUsageDTO{
 		ID:               row.ID,
 		APIKeyID:         row.APIKeyID,
 		APIKeyName:       keyName,
-		APIKey:           keyValue,
+		APIKey:           "",
 		APIKeyMasked:     keyMasked,
 		Date:             row.Date,
 		Model:            row.Model,

@@ -1044,6 +1044,57 @@ func TestListInferenceTranscriptsUsesSpaceWorkflowRequest(t *testing.T) {
 	}
 }
 
+func TestListInferenceTranscriptsPageSlicesSortedRows(t *testing.T) {
+	const spaceID = "space-1"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v3/getInferenceTranscriptsForUser" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["limit"] != float64(4) {
+			t.Fatalf("limit = %#v, want 4", body["limit"])
+		}
+		writeJSON(t, w, map[string]any{
+			"transcripts": []map[string]any{
+				{"id": "thread-1", "title": "one", "updated_at": float64(1000)},
+				{"id": "thread-5", "title": "five", "updated_at": float64(5000)},
+				{"id": "thread-2", "title": "two", "updated_at": float64(2000)},
+				{"id": "thread-4", "title": "four", "updated_at": float64(4000)},
+				{"id": "thread-3", "title": "three", "updated_at": float64(3000)},
+			},
+			"hasMore": true,
+		})
+	}))
+	defer server.Close()
+
+	gateway := NewNotionGateway(config.Config{
+		Upstream: config.UpstreamConfig{BaseURL: server.URL, Origin: server.URL},
+	})
+	got, err := gateway.ListInferenceTranscriptsPage(
+		context.Background(),
+		model.Account{Email: "user@example.com", SpaceID: spaceID, AuthToken: "token"},
+		spaceID,
+		2,
+		2,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Page != 2 || got.PageSize != 2 || got.Total != 5 || !got.HasMore {
+		t.Fatalf("unexpected page metadata: %+v", got)
+	}
+	if len(got.Data) != 2 {
+		t.Fatalf("expected 2 transcripts, got %d", len(got.Data))
+	}
+	if got.Data[0].ThreadID != "thread-3" || got.Data[1].ThreadID != "thread-2" {
+		t.Fatalf("unexpected page rows: %+v", got.Data)
+	}
+}
+
 func TestRunPromptReturnsWhenUpstreamKeepsStreamOpenAfterFinalAnswer(t *testing.T) {
 	const want = `{"ok":true,"message":"connected"}`
 	const messageID = "assistant-1"

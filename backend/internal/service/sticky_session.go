@@ -24,6 +24,7 @@ type StickyThreadBinding struct {
 	StickyKey    string    `json:"sticky_key,omitempty"`
 	ThreadID     string    `json:"thread_id"`
 	AccountID    uint      `json:"account_id"`
+	GroupID      *uint     `json:"group_id,omitempty"`
 	AccountEmail string    `json:"account_email"`
 	SpaceID      string    `json:"space_id"`
 	SpaceViewID  string    `json:"space_view_id,omitempty"`

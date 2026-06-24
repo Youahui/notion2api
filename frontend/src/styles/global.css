@@ -200,6 +200,11 @@ body {
   font-size: 12px;
 }
 
+.conversations-list-pagination {
+  margin-top: 12px;
+  text-align: right;
+}
+
 .conversations-detail-stack {
   width: 100%;
 }
@@ -242,6 +247,39 @@ body {
   margin-top: 10px;
 }
 
+.groups-member-stack {
+  width: 100%;
+}
+
+.groups-section-title {
+  margin: 0 !important;
+}
+
+.groups-description-text {
+  display: inline-block;
+  max-width: 420px;
+}
+
+.groups-priority-help {
+  color: #8c8c8c;
+  font-size: 12px;
+}
+
+.groups-add-member-row {
+  width: 100%;
+  max-width: 640px;
+}
+
+.groups-add-member-row .ant-select {
+  min-width: 320px;
+  flex: 1;
+}
+
+.groups-member-footer {
+  display: flex;
+  justify-content: flex-end;
+}
+
 @media (max-width: 640px) {
   .conversations-select {
     width: 100%;
@@ -250,5 +288,9 @@ body {
 
   .conversation-message-list {
     max-height: none;
+  }
+
+  .groups-add-member-row .ant-select {
+    min-width: 0;
   }
 }

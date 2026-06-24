@@ -43,6 +43,7 @@ type CompletionResult struct {
 
 type OpenAIRequestOptions struct {
 	APIKeyID             uint
+	GroupID              *uint
 	RequestID            string
 	HeaderSessionID      string
 	HeaderConversationID string
@@ -240,8 +241,9 @@ func (s *OpenAIService) ChatCompletion(ctx context.Context, req dto.ChatCompleti
 		logCodexToolCallConversion(options, result)
 		return result, nil
 	}
+	preferredEmail := requestedAccountEmail(req.AccountEmail, req.NotionAccountEmail, req.Metadata)
 	sessionKeys := chatStickySessionKeys(req, options)
-	selection, err := s.selectAccountForStickyKeys(ctx, requestedAccountEmail(req.AccountEmail, req.NotionAccountEmail, req.Metadata), threadID, sessionKeys)
+	selection, err := s.selectAccountForStickyKeys(ctx, preferredEmail, threadID, sessionKeys, options, row.PublicID)
 	if err != nil {
 		return CompletionResult{}, err
 	}
@@ -268,7 +270,7 @@ func (s *OpenAIService) ChatCompletion(ctx context.Context, req dto.ChatCompleti
 		UpstreamThreadID: selection.ThreadID,
 		RawMessageCount:  len(req.Messages),
 	}
-	account, notionResult, err := s.runPromptWithHealth(ctx, account, notionReq)
+	account, notionResult, selection, err := s.runPromptWithFailover(ctx, selection, sessionKeys, options, preferredEmail, row.PublicID, notionReq)
 	if err != nil {
 		if isTrustRuleDeniedInferenceError(err) {
 			s.clearStickyThreadBindings(ctx, selection.ThreadID, sessionKeys)
@@ -279,7 +281,7 @@ func (s *OpenAIService) ChatCompletion(ctx context.Context, req dto.ChatCompleti
 	s.accounts.MarkSuccess(ctx, account.ID)
 	answer := notionResult.Text
 	sessionKeys = appendUniqueStickyKeys(sessionKeys, chatCompletionAnswerStickyKeys(req, answer, options))
-	s.bindStickyThread(ctx, account, notionResult, sessionKeys, "", options.APIKeyID)
+	s.bindStickyThread(ctx, account, notionResult, sessionKeys, "", options)
 	promptTokens := security.EstimateTokens(firstNonEmpty(notionPrompt, prompt, hiddenPrompt))
 	completionTokens := security.EstimateTokens(answer)
 	usage := dto.UsageDTO{
@@ -460,8 +462,9 @@ func (s *OpenAIService) Response(ctx context.Context, body map[string]any, opts 
 		s.storeResponseResult(body, options, result)
 		return result, nil
 	}
+	preferredEmail := requestedAccountEmailFromMap(body)
 	sessionKeys := responseStickySessionKeys(body, options)
-	selection, err := s.selectAccountForStickyKeys(ctx, requestedAccountEmailFromMap(body), threadID, sessionKeys)
+	selection, err := s.selectAccountForStickyKeys(ctx, preferredEmail, threadID, sessionKeys, options, row.PublicID)
 	if err != nil {
 		return CompletionResult{}, err
 	}
@@ -487,7 +490,7 @@ func (s *OpenAIService) Response(ctx context.Context, body map[string]any, opts 
 		UpstreamThreadID: selection.ThreadID,
 		RawMessageCount:  1,
 	}
-	account, notionResult, err := s.runPromptWithHealth(ctx, account, notionReq)
+	account, notionResult, selection, err := s.runPromptWithFailover(ctx, selection, sessionKeys, options, preferredEmail, row.PublicID, notionReq)
 	if err != nil {
 		if isTrustRuleDeniedInferenceError(err) {
 			s.clearStickyThreadBindings(ctx, selection.ThreadID, sessionKeys)
@@ -526,7 +529,7 @@ func (s *OpenAIService) Response(ctx context.Context, body map[string]any, opts 
 	}
 	if toolResult, ok := maybeBuildCodexAssistantTextToolCallResult(row.PublicID, body, answer, trace); ok {
 		if responseID := stringFromAny(toolResult.Payload["id"]); responseID != "" {
-			s.bindStickyThread(ctx, account, notionResult, sessionKeys, responseID, options.APIKeyID)
+			s.bindStickyThread(ctx, account, notionResult, sessionKeys, responseID, options)
 		}
 		logCodexToolCallConversion(options, toolResult)
 		s.storeResponseResult(body, options, toolResult)
@@ -538,7 +541,7 @@ func (s *OpenAIService) Response(ctx context.Context, body map[string]any, opts 
 		usage.CompletionTokens = completionTokens
 		usage.TotalTokens = usage.PromptTokens + completionTokens
 	}
-	s.bindStickyThread(ctx, account, notionResult, sessionKeys, responseID, options.APIKeyID)
+	s.bindStickyThread(ctx, account, notionResult, sessionKeys, responseID, options)
 	payload := buildResponsesPayload(row.PublicID, answer, usage, responseID, newResponsesID("msg"), createdAt, body, trace)
 	if incompleteDetails != nil {
 		payload["status"] = "incomplete"
@@ -593,7 +596,7 @@ func (s *OpenAIService) ResponseStream(ctx context.Context, body map[string]any,
 		return result, false, nil
 	}
 	sessionKeys := responseStickySessionKeys(body, options)
-	selection, err := s.selectAccountForStickyKeys(ctx, requestedAccountEmailFromMap(body), threadID, sessionKeys)
+	selection, err := s.selectAccountForStickyKeys(ctx, requestedAccountEmailFromMap(body), threadID, sessionKeys, options, row.PublicID)
 	if err != nil {
 		return CompletionResult{}, false, err
 	}
@@ -697,7 +700,7 @@ func (s *OpenAIService) ResponseStream(ctx context.Context, body map[string]any,
 	if !streamStarted {
 		if toolResult, ok := maybeBuildCodexAssistantTextToolCallResult(row.PublicID, body, answer, trace); ok {
 			if responseID := stringFromAny(toolResult.Payload["id"]); responseID != "" {
-				s.bindStickyThread(ctx, account, notionResult, sessionKeys, responseID, options.APIKeyID)
+				s.bindStickyThread(ctx, account, notionResult, sessionKeys, responseID, options)
 			}
 			logCodexToolCallConversion(options, toolResult)
 			s.storeResponseResult(body, options, toolResult)
@@ -710,7 +713,7 @@ func (s *OpenAIService) ResponseStream(ctx context.Context, body map[string]any,
 		usage.CompletionTokens = completionTokens
 		usage.TotalTokens = usage.PromptTokens + completionTokens
 	}
-	s.bindStickyThread(ctx, account, notionResult, sessionKeys, responseID, options.APIKeyID)
+	s.bindStickyThread(ctx, account, notionResult, sessionKeys, responseID, options)
 	payload := buildResponsesPayload(row.PublicID, answer, usage, responseID, outputItemID, createdAt, body, trace)
 	if incompleteDetails != nil {
 		payload["status"] = "incomplete"
@@ -722,11 +725,11 @@ func (s *OpenAIService) ResponseStream(ctx context.Context, body map[string]any,
 	return result, streamStarted, nil
 }
 
-func (s *OpenAIService) selectAccountForStickyKeys(ctx context.Context, preferredEmail string, threadID string, sessionKeys []stickySessionKey) (accountSelection, error) {
+func (s *OpenAIService) selectAccountForStickyKeys(ctx context.Context, preferredEmail string, threadID string, sessionKeys []stickySessionKey, opts OpenAIRequestOptions, model string) (accountSelection, error) {
 	threadID = strings.TrimSpace(threadID)
 	preferredEmail = strings.TrimSpace(preferredEmail)
 	if threadID != "" {
-		account, stickyHit, err := s.selectAccountForThread(ctx, preferredEmail, threadID)
+		account, stickyHit, err := s.selectAccountForThread(ctx, preferredEmail, threadID, opts, model)
 		return accountSelection{Account: account, StickyHit: stickyHit, ThreadID: threadID, Source: stickySource(stickyHit, "thread_id")}, err
 	}
 	if s.sticky != nil {
@@ -734,7 +737,7 @@ func (s *OpenAIService) selectAccountForStickyKeys(ctx context.Context, preferre
 			if key.Key == "" {
 				continue
 			}
-			selection, ok, err := s.selectAccountForBindingKey(ctx, preferredEmail, key)
+			selection, ok, err := s.selectAccountForBindingKey(ctx, preferredEmail, key, opts, model)
 			if err != nil {
 				return accountSelection{}, err
 			}
@@ -743,46 +746,52 @@ func (s *OpenAIService) selectAccountForStickyKeys(ctx context.Context, preferre
 			}
 		}
 	}
-	account, err := s.accounts.Select(ctx, preferredEmail)
+	account, err := s.accounts.SelectWithScope(ctx, accountSelectionOptions(preferredEmail, opts, model, nil))
 	return accountSelection{Account: account}, err
 }
 
-func (s *OpenAIService) selectAccountForThread(ctx context.Context, preferredEmail string, threadID string) (model.Account, bool, error) {
+func (s *OpenAIService) selectAccountForThread(ctx context.Context, preferredEmail string, threadID string, opts OpenAIRequestOptions, modelID string) (model.Account, bool, error) {
 	threadID = strings.TrimSpace(threadID)
 	preferredEmail = strings.TrimSpace(preferredEmail)
 	if threadID == "" || s.sticky == nil {
-		account, err := s.accounts.Select(ctx, preferredEmail)
+		account, err := s.accounts.SelectWithScope(ctx, accountSelectionOptions(preferredEmail, opts, modelID, nil))
 		return account, false, err
 	}
 	binding, ok, err := s.sticky.Get(ctx, threadID)
 	if err != nil {
 		slog.Warn("sticky session lookup failed", "thread_id", threadID, "error", err)
-		account, selectErr := s.accounts.Select(ctx, preferredEmail)
+		account, selectErr := s.accounts.SelectWithScope(ctx, accountSelectionOptions(preferredEmail, opts, modelID, nil))
 		return account, false, selectErr
 	}
 	if !ok || binding.AccountID == 0 {
-		account, err := s.accounts.Select(ctx, preferredEmail)
+		account, err := s.accounts.SelectWithScope(ctx, accountSelectionOptions(preferredEmail, opts, modelID, nil))
 		return account, false, err
 	}
 	account, err := s.accounts.Get(ctx, binding.AccountID)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			_ = s.sticky.Delete(ctx, threadID)
-			account, selectErr := s.accounts.Select(ctx, preferredEmail)
+			account, selectErr := s.accounts.SelectWithScope(ctx, accountSelectionOptions(preferredEmail, opts, modelID, nil))
 			return account, false, selectErr
 		}
 		return model.Account{}, false, err
 	}
-	if !account.Enabled {
-		return model.Account{}, false, fmt.Errorf("%w: notion_thread_id %s is bound to disabled account %s", ErrForbidden, threadID, account.Email)
-	}
 	if preferredEmail != "" && !strings.EqualFold(account.Email, preferredEmail) {
 		return model.Account{}, false, fmt.Errorf("%w: notion_thread_id %s is bound to account %s, not %s", ErrConflict, threadID, account.Email, preferredEmail)
+	}
+	ok, err = s.accounts.AccountSchedulableInScope(ctx, account, accountSelectionOptions(preferredEmail, opts, modelID, nil))
+	if err != nil {
+		return model.Account{}, false, err
+	}
+	if !ok {
+		_ = s.sticky.Delete(ctx, threadID)
+		account, selectErr := s.accounts.SelectWithScope(ctx, accountSelectionOptions(preferredEmail, opts, modelID, nil))
+		return account, false, selectErr
 	}
 	return account, true, nil
 }
 
-func (s *OpenAIService) selectAccountForBindingKey(ctx context.Context, preferredEmail string, key stickySessionKey) (accountSelection, bool, error) {
+func (s *OpenAIService) selectAccountForBindingKey(ctx context.Context, preferredEmail string, key stickySessionKey, opts OpenAIRequestOptions, modelID string) (accountSelection, bool, error) {
 	binding, ok, err := s.sticky.Get(ctx, key.Key)
 	if err != nil {
 		slog.Warn("sticky session lookup failed", "sticky_key", key.Source, "error", err)
@@ -799,12 +808,16 @@ func (s *OpenAIService) selectAccountForBindingKey(ctx context.Context, preferre
 		}
 		return accountSelection{}, false, err
 	}
-	if !account.Enabled {
-		_ = s.sticky.Delete(ctx, key.Key)
-		return accountSelection{}, false, nil
-	}
 	if preferredEmail != "" && !strings.EqualFold(account.Email, preferredEmail) {
 		return accountSelection{}, false, fmt.Errorf("%w: session %s is bound to account %s, not %s", ErrConflict, key.Source, account.Email, preferredEmail)
+	}
+	valid, err := s.accounts.AccountSchedulableInScope(ctx, account, accountSelectionOptions(preferredEmail, opts, modelID, nil))
+	if err != nil {
+		return accountSelection{}, false, err
+	}
+	if !valid {
+		_ = s.sticky.Delete(ctx, key.Key)
+		return accountSelection{}, false, nil
 	}
 	return accountSelection{
 		Account:   account,
@@ -814,7 +827,24 @@ func (s *OpenAIService) selectAccountForBindingKey(ctx context.Context, preferre
 	}, true, nil
 }
 
-func (s *OpenAIService) bindStickyThread(ctx context.Context, account model.Account, result NotionRunResult, sessionKeys []stickySessionKey, responseID string, apiKeyID uint) {
+func accountSelectionOptions(preferredEmail string, opts OpenAIRequestOptions, model string, failed map[uint]struct{}) AccountSelectionOptions {
+	return AccountSelectionOptions{
+		GroupID:          opts.GroupID,
+		PreferredEmail:   preferredEmail,
+		Model:            model,
+		FailedAccountIDs: failed,
+	}
+}
+
+func copyUintPtr(value *uint) *uint {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func (s *OpenAIService) bindStickyThread(ctx context.Context, account model.Account, result NotionRunResult, sessionKeys []stickySessionKey, responseID string, opts OpenAIRequestOptions) {
 	if s.sticky == nil || account.ID == 0 || result.ConvertedOnly {
 		return
 	}
@@ -826,6 +856,7 @@ func (s *OpenAIService) bindStickyThread(ctx context.Context, account model.Acco
 		StickyKey:    threadID,
 		ThreadID:     threadID,
 		AccountID:    account.ID,
+		GroupID:      copyUintPtr(opts.GroupID),
 		AccountEmail: account.Email,
 		SpaceID:      account.SpaceID,
 		SpaceViewID:  account.SpaceViewID,
@@ -836,11 +867,12 @@ func (s *OpenAIService) bindStickyThread(ctx context.Context, account model.Acco
 	binding := StickyThreadBinding{
 		ThreadID:     threadID,
 		AccountID:    account.ID,
+		GroupID:      copyUintPtr(opts.GroupID),
 		AccountEmail: account.Email,
 		SpaceID:      account.SpaceID,
 		SpaceViewID:  account.SpaceViewID,
 	}
-	for _, key := range appendUniqueStickyKeys(sessionKeys, []stickySessionKey{{Key: responseStickyKey(apiKeyID, responseID), Source: "response_id"}}) {
+	for _, key := range appendUniqueStickyKeys(sessionKeys, []stickySessionKey{{Key: responseStickyKey(opts.APIKeyID, responseID), Source: "response_id"}}) {
 		if key.Key == "" {
 			continue
 		}
@@ -1205,6 +1237,59 @@ func (s *OpenAIService) runPromptWithHealth(ctx context.Context, account model.A
 	}
 	result, err = s.notion.RunPrompt(ctx, account, req)
 	return account, result, err
+}
+
+func (s *OpenAIService) runPromptWithFailover(ctx context.Context, selection accountSelection, sessionKeys []stickySessionKey, opts OpenAIRequestOptions, preferredEmail string, modelID string, req NotionPromptRequest) (model.Account, NotionRunResult, accountSelection, error) {
+	failed := map[uint]struct{}{}
+	current := selection
+	currentReq := req
+	for attempts := 0; attempts < 3; attempts++ {
+		account, result, err := s.runPromptWithHealth(ctx, current.Account, currentReq)
+		if err == nil {
+			return account, result, current, nil
+		}
+		if account.ID != 0 {
+			failed[account.ID] = struct{}{}
+		}
+		if !isAccountFailoverError(err) {
+			return account, result, current, err
+		}
+		if current.ThreadID != "" || len(sessionKeys) > 0 {
+			s.clearStickyThreadBindings(ctx, current.ThreadID, sessionKeys)
+		}
+		next, selectErr := s.accounts.SelectWithScope(ctx, accountSelectionOptions(preferredEmail, opts, modelID, failed))
+		if selectErr != nil {
+			return account, result, current, err
+		}
+		if next.ID == 0 || next.ID == account.ID {
+			return account, result, current, err
+		}
+		if account.ID != 0 {
+			s.accounts.MarkFailure(ctx, account.ID, err.Error())
+		}
+		current = accountSelection{Account: next}
+		currentReq.UpstreamThreadID = ""
+	}
+	return current.Account, NotionRunResult{}, current, ErrNotFound
+}
+
+func isAccountFailoverError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if isSessionRetryableError(err) {
+		return true
+	}
+	var apiErr *NotionAPIError
+	if errors.As(err, &apiErr) {
+		return apiErr.StatusCode == 429 || apiErr.StatusCode >= 500
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(message, "rate limit") ||
+		strings.Contains(message, "too many requests") ||
+		strings.Contains(message, "overloaded") ||
+		strings.Contains(message, "temporarily unavailable") ||
+		strings.Contains(message, "timeout")
 }
 
 func (s *OpenAIService) runPromptStreamWithHealth(ctx context.Context, account model.Account, req NotionPromptRequest, onTextDelta notionTextDeltaFunc) (model.Account, NotionRunResult, error) {

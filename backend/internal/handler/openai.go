@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"notion2api/backend/internal/dto"
+	"notion2api/backend/internal/model"
 	"notion2api/backend/internal/pkg/requestctx"
 	"notion2api/backend/internal/pkg/respond"
 	"notion2api/backend/internal/service"
@@ -45,7 +46,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		return
 	}
 	apiKey, _ := requestctx.APIKey(c)
-	result, err := h.openai.ChatCompletion(c.Request.Context(), req, openAIRequestOptions(c, apiKey.ID))
+	result, err := h.openai.ChatCompletion(c.Request.Context(), req, openAIRequestOptions(c, apiKey))
 	if err != nil {
 		handleOpenAIError(c, err)
 		return
@@ -79,7 +80,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	apiKey, _ := requestctx.APIKey(c)
 	if stream, _ := body["stream"].(bool); stream {
 		streamWriter := newLiveResponsesStreamWriter(c)
-		result, streamed, err := h.openai.ResponseStream(c.Request.Context(), body, streamWriter.Start, streamWriter.Delta, openAIRequestOptions(c, apiKey.ID))
+		result, streamed, err := h.openai.ResponseStream(c.Request.Context(), body, streamWriter.Start, streamWriter.Delta, openAIRequestOptions(c, apiKey))
 		if err != nil {
 			if streamed || streamWriter.Started() {
 				streamWriter.Error(err)
@@ -107,7 +108,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		})
 		return
 	}
-	result, err := h.openai.Response(c.Request.Context(), body, openAIRequestOptions(c, apiKey.ID))
+	result, err := h.openai.Response(c.Request.Context(), body, openAIRequestOptions(c, apiKey))
 	if err != nil {
 		handleOpenAIError(c, err)
 		return
@@ -129,7 +130,7 @@ func (h *Handler) Responses(c *gin.Context) {
 
 func (h *Handler) ResponseByID(c *gin.Context) {
 	apiKey, _ := requestctx.APIKey(c)
-	payload, err := h.openai.ResponseByID(c.Request.Context(), c.Param("id"), openAIRequestOptions(c, apiKey.ID))
+	payload, err := h.openai.ResponseByID(c.Request.Context(), c.Param("id"), openAIRequestOptions(c, apiKey))
 	if err != nil {
 		handleResponseStoreError(c, err)
 		return
@@ -139,7 +140,7 @@ func (h *Handler) ResponseByID(c *gin.Context) {
 
 func (h *Handler) ResponseDelete(c *gin.Context) {
 	apiKey, _ := requestctx.APIKey(c)
-	payload, err := h.openai.DeleteResponse(c.Request.Context(), c.Param("id"), openAIRequestOptions(c, apiKey.ID))
+	payload, err := h.openai.DeleteResponse(c.Request.Context(), c.Param("id"), openAIRequestOptions(c, apiKey))
 	if err != nil {
 		handleResponseStoreError(c, err)
 		return
@@ -158,7 +159,7 @@ func (h *Handler) ResponseInputItems(c *gin.Context) {
 		}
 		limit = parsed
 	}
-	payload, err := h.openai.ResponseInputItems(c.Request.Context(), c.Param("id"), limit, c.Query("after"), openAIRequestOptions(c, apiKey.ID))
+	payload, err := h.openai.ResponseInputItems(c.Request.Context(), c.Param("id"), limit, c.Query("after"), openAIRequestOptions(c, apiKey))
 	if err != nil {
 		handleResponseStoreError(c, err)
 		return
@@ -166,9 +167,10 @@ func (h *Handler) ResponseInputItems(c *gin.Context) {
 	c.JSON(http.StatusOK, payload)
 }
 
-func openAIRequestOptions(c *gin.Context, apiKeyID uint) service.OpenAIRequestOptions {
+func openAIRequestOptions(c *gin.Context, apiKey model.APIKey) service.OpenAIRequestOptions {
 	return service.OpenAIRequestOptions{
-		APIKeyID:             apiKeyID,
+		APIKeyID:             apiKey.ID,
+		GroupID:              apiKey.GroupID,
 		RequestID:            c.GetString("request_id"),
 		HeaderSessionID:      firstOpenAIHeader(c, "session_id", "Session-Id", "X-Session-Id"),
 		HeaderConversationID: firstOpenAIHeader(c, "conversation_id", "Conversation-Id", "X-Conversation-Id"),

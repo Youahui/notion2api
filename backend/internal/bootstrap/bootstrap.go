@@ -38,6 +38,9 @@ func Run(ctx context.Context, configPath string) error {
 	if err := admins.SeedBootstrapAdmin(ctx, cfg.Security.BootstrapAdmin); err != nil {
 		return fmt.Errorf("seed admin: %w", err)
 	}
+	if _, err := accounts.EnsureDefaultGroup(ctx); err != nil {
+		return fmt.Errorf("seed default account group: %w", err)
+	}
 	if err := keys.SeedBootstrapAPIKey(ctx, cfg.Security.BootstrapAPIKey); err != nil {
 		return fmt.Errorf("seed API 密钥: %w", err)
 	}

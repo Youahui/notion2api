@@ -1,4 +1,4 @@
-import { ApiOutlined, BarChartOutlined, DashboardOutlined, DatabaseOutlined, KeyOutlined, LogoutOutlined, RobotOutlined, SettingOutlined, TeamOutlined, UnorderedListOutlined } from '@ant-design/icons';
+import { ApiOutlined, ApartmentOutlined, BarChartOutlined, DashboardOutlined, DatabaseOutlined, KeyOutlined, LogoutOutlined, RobotOutlined, SettingOutlined, TeamOutlined, UnorderedListOutlined } from '@ant-design/icons';
 import { Button, Layout, Menu, Space, Typography, App as AntApp } from 'antd';
 import { useMemo } from 'react';
 import { Link, Navigate, Outlet, useLocation, useNavigate } from 'react-router-dom';
@@ -18,6 +18,9 @@ export function AdminLayout() {
     if (parts[1] === 'accounts') {
       return [`accounts-${parts[2] ?? 'list'}`];
     }
+    if (parts[1] === 'groups') {
+      return ['accounts-groups'];
+    }
     return [parts[1] ?? 'dashboard'];
   }, [location.pathname]);
 
@@ -35,7 +38,7 @@ export function AdminLayout() {
           theme="dark"
           mode="inline"
           selectedKeys={selectedKeys}
-          defaultOpenKeys={location.pathname.startsWith('/admin/accounts') ? ['accounts'] : []}
+          defaultOpenKeys={location.pathname.startsWith('/admin/accounts') || location.pathname.startsWith('/admin/groups') ? ['accounts'] : []}
           items={[
             { key: 'dashboard', icon: <DashboardOutlined />, label: <Link to="/admin">仪表盘</Link> },
             { key: 'admins', icon: <TeamOutlined />, label: <Link to="/admin/admins">管理员</Link> },
@@ -48,6 +51,7 @@ export function AdminLayout() {
               label: '账号池',
               children: [
                 { key: 'accounts-list', label: <Link to="/admin/accounts/list">账号列表</Link> },
+                { key: 'accounts-groups', icon: <ApartmentOutlined />, label: <Link to="/admin/groups">账号组</Link> },
                 { key: 'accounts-add', label: <Link to="/admin/accounts/add">添加账号</Link> },
                 { key: 'accounts-test', label: <Link to="/admin/accounts/test">测试账号</Link> },
                 { key: 'accounts-logs', label: <Link to="/admin/accounts/logs">运行日志</Link> }

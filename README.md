@@ -35,7 +35,7 @@ Notion2API 是一个基于 Go 的 Notion AI OpenAI / Codex 兼容桥接服务。
 - OpenAI 兼容接口：模型列表、Chat Completions、Responses。
 - 支持 `stream: true`，以 SSE 格式返回 OpenAI 风格的流式数据。
 - Codex Responses 兼容：支持文件引用、常用本地工具调用协议和工具名透传。
-- Notion 账号池管理：账号启停、激活账号、优先级、并发数、失败状态、账号测试。
+- Notion 账号池管理：账号启停、账号组、API Key 绑定账号组、优先级、并发数、失败状态、账号测试。
 - Notion 登录辅助：支持邮箱验证码登录，也支持手工导入 Cookie、`token_v2` 或探测结果 JSON。
 - API Key 管理：创建、启用、禁用、删除、过期时间、总额度和每日额度。
 - 用量与日志：按 API Key、模型、日期记录请求数、估算 token 和请求日志。
@@ -146,7 +146,7 @@ curl http://127.0.0.1:9998/healthz
 打开管理台：
 
 ```bash
-http://127.0.0.1:8080/admin
+http://127.0.0.1:5173/admin
 ```
 
 如果需要 PostgreSQL：
@@ -206,6 +206,8 @@ docker build -t notion2api:latest .
 | 用量日志 | `/admin/usage`、`/admin/logs` | token 估算用量和请求日志。 |
 
 管理接口除 `/admin/login` 外，都支持通过 `X-Admin-Token`、`Authorization: Bearer <token>` 或登录 Cookie 鉴权。
+
+`GET /admin/notion-conversations` 支持 `account_id`、`space_id`、`page`、`page_size` 查询参数；兼容旧的 `limit` 参数作为第一页页大小。
 
 ## API 用法
 
@@ -300,6 +302,8 @@ Codex 原生 Responses 请求会在本地兼容以下能力：
 
 未被识别的 OpenAI 扩展字段通常会被忽略或透传到内部转换层；是否生效取决于当前上游 Notion AI 协议和模型能力。
 
+API Key 可绑定一个账号组。请求鉴权后，服务只会在该 Key 绑定的账号组内选择 Notion 账号；同会话 sticky 命中后也会重新校验账号是否仍属于当前账号组、是否启用且可调度。
+
 ## 管理台
 
 管理台挂载在 `/admin` 路由下，前端开发服务默认访问 `http://127.0.0.1:5173/admin`。
@@ -309,7 +313,7 @@ Codex 原生 Responses 请求会在本地兼容以下能力：
 - 仪表盘：服务状态、关键统计。
 - 管理员：管理员账号创建、更新、启停。
 - API Keys：创建和管理可分发 API Key，查看额度和用量。
-- 账号池：Notion 账号登录、手工导入、激活、测试、空间查看。
+- 账号池：Notion 账号登录、手工导入、账号组、激活、测试、空间查看。
 - 模型：查看当前公开模型和对应 Notion 内部模型。
 - 会话：读取和删除 Notion 远端 AI 会话。
 - 请求测试：在管理台内发起测试请求。

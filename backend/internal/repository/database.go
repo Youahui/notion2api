@@ -83,6 +83,8 @@ func (s *Store) AutoMigrate() error {
 	return s.db.AutoMigrate(
 		&model.AdminUser{},
 		&model.AdminToken{},
+		&model.AccountGroup{},
+		&model.AccountGroupMember{},
 		&model.APIKey{},
 		&model.APIKeyUsage{},
 		&model.Account{},

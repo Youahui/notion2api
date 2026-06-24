@@ -132,7 +132,7 @@ func TestOpenAIServiceSelectAccountForClientSessionBinding(t *testing.T) {
 	}
 	svc := &OpenAIService{cfg: cfg, accounts: NewAccountService(store, cfg), sticky: sticky}
 
-	selection, err := svc.selectAccountForStickyKeys(ctx, "", "", []stickySessionKey{sessionKey})
+	selection, err := svc.selectAccountForStickyKeys(ctx, "", "", []stickySessionKey{sessionKey}, OpenAIRequestOptions{APIKeyID: 7}, "auto")
 	if err != nil {
 		t.Fatalf("select account: %v", err)
 	}
@@ -141,6 +141,64 @@ func TestOpenAIServiceSelectAccountForClientSessionBinding(t *testing.T) {
 	}
 	if selection.Account.ID != account.ID || selection.ThreadID != "notion-thread-1" {
 		t.Fatalf("unexpected sticky selection: %+v", selection)
+	}
+}
+
+func TestOpenAIServiceStickyMissesOutsideGroup(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.Database.DSN = ":memory:"
+	store, err := repository.OpenDatabase(cfg.Database)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	if err := store.AutoMigrate(); err != nil {
+		t.Fatalf("auto migrate: %v", err)
+	}
+	groupA := model.AccountGroup{Name: "group-a", Enabled: true}
+	groupB := model.AccountGroup{Name: "group-b", Enabled: true}
+	if err := store.CreateAccountGroup(ctx, &groupA); err != nil {
+		t.Fatalf("create group A: %v", err)
+	}
+	if err := store.CreateAccountGroup(ctx, &groupB); err != nil {
+		t.Fatalf("create group B: %v", err)
+	}
+	accountA := model.Account{Email: "a@example.com", Enabled: true, Status: "ready"}
+	accountB := model.Account{Email: "b@example.com", Enabled: true, Status: "ready"}
+	if err := store.CreateAccount(ctx, &accountA); err != nil {
+		t.Fatalf("create account A: %v", err)
+	}
+	if err := store.CreateAccount(ctx, &accountB); err != nil {
+		t.Fatalf("create account B: %v", err)
+	}
+	if err := store.ReplaceAccountGroupMembers(ctx, groupA.ID, []model.AccountGroupMember{{GroupID: groupA.ID, AccountID: accountA.ID, Enabled: true}}); err != nil {
+		t.Fatalf("bind account A: %v", err)
+	}
+	if err := store.ReplaceAccountGroupMembers(ctx, groupB.ID, []model.AccountGroupMember{{GroupID: groupB.ID, AccountID: accountB.ID, Enabled: true}}); err != nil {
+		t.Fatalf("bind account B: %v", err)
+	}
+	sticky := newMemoryStickySessionStore(time.Minute)
+	sessionKey := clientStickyKey(7, "header_session_id", "sess-1")
+	if err := sticky.Set(ctx, StickyThreadBinding{
+		StickyKey:    sessionKey.Key,
+		ThreadID:     "notion-thread-1",
+		AccountID:    accountA.ID,
+		GroupID:      &groupA.ID,
+		AccountEmail: accountA.Email,
+	}, time.Minute); err != nil {
+		t.Fatalf("set sticky alias: %v", err)
+	}
+	svc := &OpenAIService{cfg: cfg, accounts: NewAccountService(store, cfg), sticky: sticky}
+
+	selection, err := svc.selectAccountForStickyKeys(ctx, "", "", []stickySessionKey{sessionKey}, OpenAIRequestOptions{APIKeyID: 7, GroupID: &groupB.ID}, "auto")
+	if err != nil {
+		t.Fatalf("select account: %v", err)
+	}
+	if selection.StickyHit {
+		t.Fatalf("expected sticky miss outside group, got %+v", selection)
+	}
+	if selection.Account.ID != accountB.ID {
+		t.Fatalf("expected account B, got %+v", selection.Account)
 	}
 }
 

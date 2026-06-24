@@ -32,6 +32,12 @@ type NotionGateway struct {
 	clients *proxyclient.Manager
 }
 
+const (
+	notionConversationDefaultPageSize = 50
+	notionConversationMaxPageSize     = 100
+	notionConversationMaxFetchLimit   = 1000
+)
+
 type NotionPromptRequest struct {
 	Prompt           string
 	HiddenPrompt     string
@@ -251,20 +257,74 @@ func (g *NotionGateway) ProbeProtocolHealth(ctx context.Context, account model.A
 }
 
 func (g *NotionGateway) ListInferenceTranscripts(ctx context.Context, account model.Account, spaceID string, limit int) ([]dto.NotionConversationSummaryDTO, error) {
+	if limit <= 0 {
+		limit = notionConversationDefaultPageSize
+	}
+	if limit > notionConversationMaxPageSize {
+		limit = notionConversationMaxPageSize
+	}
+	items, _, err := g.fetchInferenceTranscripts(ctx, account, spaceID, limit)
+	return items, err
+}
+
+func (g *NotionGateway) ListInferenceTranscriptsPage(ctx context.Context, account model.Account, spaceID string, page int, pageSize int) (dto.NotionConversationPageDTO, error) {
+	page, pageSize = normalizeNotionConversationPagination(page, pageSize)
+	fetchLimit := page * pageSize
+	if fetchLimit > notionConversationMaxFetchLimit {
+		return dto.NotionConversationPageDTO{}, fmt.Errorf("%w: page and page_size exceed maximum fetch window %d", ErrInvalid, notionConversationMaxFetchLimit)
+	}
+	items, upstreamHasMore, err := g.fetchInferenceTranscripts(ctx, account, spaceID, fetchLimit)
+	if err != nil {
+		return dto.NotionConversationPageDTO{}, err
+	}
+	start := (page - 1) * pageSize
+	if start > len(items) {
+		start = len(items)
+	}
+	end := start + pageSize
+	if end > len(items) {
+		end = len(items)
+	}
+	hasMore := upstreamHasMore || end < len(items)
+	total := len(items)
+	if hasMore && total <= end {
+		total = end + 1
+	}
+	return dto.NotionConversationPageDTO{
+		Data:     items[start:end],
+		Page:     page,
+		PageSize: pageSize,
+		Total:    total,
+		HasMore:  hasMore,
+	}, nil
+}
+
+func normalizeNotionConversationPagination(page int, pageSize int) (int, int) {
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = notionConversationDefaultPageSize
+	}
+	if pageSize > notionConversationMaxPageSize {
+		pageSize = notionConversationMaxPageSize
+	}
+	return page, pageSize
+}
+
+func (g *NotionGateway) fetchInferenceTranscripts(ctx context.Context, account model.Account, spaceID string, limit int) ([]dto.NotionConversationSummaryDTO, bool, error) {
 	spaceID = firstNonEmpty(spaceID, account.SpaceID)
 	if spaceID == "" {
-		return nil, fmt.Errorf("%w: space_id is required", ErrInvalid)
-	}
-	if limit <= 0 {
-		limit = 50
-	}
-	if limit > 100 {
-		limit = 100
+		return nil, false, fmt.Errorf("%w: space_id is required", ErrInvalid)
 	}
 	account.SpaceID = spaceID
 	out, err := g.postNotionJSON(ctx, account, "getInferenceTranscriptsForUser", inferenceTranscriptsForSpacePayload(spaceID, limit), g.chatReferer(""))
 	if err != nil {
-		return nil, err
+		return nil, false, err
+	}
+	upstreamHasMore, _ := boolFromAny(out["hasMore"])
+	if !upstreamHasMore {
+		upstreamHasMore, _ = boolFromAny(out["has_more"])
 	}
 	rawItems := sliceFromAny(out["transcripts"])
 	items := make([]dto.NotionConversationSummaryDTO, 0, len(rawItems))
@@ -295,7 +355,7 @@ func (g *NotionGateway) ListInferenceTranscripts(ctx context.Context, account mo
 	sort.SliceStable(items, func(i, j int) bool {
 		return notionConversationSortTime(items[i]).After(notionConversationSortTime(items[j]))
 	})
-	return items, nil
+	return items, upstreamHasMore, nil
 }
 
 func (g *NotionGateway) LoadInferenceTranscript(ctx context.Context, account model.Account, spaceID string, threadID string) (dto.NotionConversationDetailDTO, error) {

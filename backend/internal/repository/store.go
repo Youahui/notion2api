@@ -21,6 +21,183 @@ type UsageFilter struct {
 
 type AccountFilter struct {
 	IncludeDisabled bool
+	GroupID         *uint
+}
+
+func (s *Store) EnsureDefaultAccountGroup(ctx context.Context) (model.AccountGroup, error) {
+	var group model.AccountGroup
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		err := tx.Where("name = ?", "default").First(&group).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			group = model.AccountGroup{
+				Name:        "default",
+				Description: "Default account pool",
+				Enabled:     true,
+				IsDefault:   true,
+			}
+			if err := tx.Create(&group).Error; err != nil {
+				return err
+			}
+		} else if err != nil {
+			return err
+		}
+		updates := map[string]any{}
+		if !group.Enabled {
+			group.Enabled = true
+			updates["enabled"] = true
+		}
+		if !group.IsDefault {
+			group.IsDefault = true
+			updates["is_default"] = true
+		}
+		if len(updates) > 0 {
+			if err := tx.Model(&group).Updates(updates).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Model(&model.AccountGroup{}).Where("id <> ? AND is_default = ?", group.ID, true).Update("is_default", false).Error; err != nil {
+			return err
+		}
+		var accounts []model.Account
+		if err := tx.Find(&accounts).Error; err != nil {
+			return err
+		}
+		for _, account := range accounts {
+			member := model.AccountGroupMember{
+				GroupID:   group.ID,
+				AccountID: account.ID,
+				Enabled:   true,
+				Priority:  account.Priority,
+			}
+			if err := tx.Where("group_id = ? AND account_id = ?", group.ID, account.ID).FirstOrCreate(&member).Error; err != nil {
+				return err
+			}
+		}
+		return tx.Model(&model.APIKey{}).Where("group_id IS NULL").Update("group_id", &group.ID).Error
+	})
+	return group, err
+}
+
+func (s *Store) ListAccountGroups(ctx context.Context) ([]model.AccountGroup, error) {
+	var rows []model.AccountGroup
+	err := s.db.WithContext(ctx).Order("is_default desc, name asc, id asc").Find(&rows).Error
+	return rows, err
+}
+
+func (s *Store) CreateAccountGroup(ctx context.Context, group *model.AccountGroup) error {
+	return s.db.WithContext(ctx).Create(group).Error
+}
+
+func (s *Store) GetAccountGroup(ctx context.Context, id uint) (model.AccountGroup, error) {
+	var group model.AccountGroup
+	err := s.db.WithContext(ctx).First(&group, id).Error
+	return group, err
+}
+
+func (s *Store) GetDefaultAccountGroup(ctx context.Context) (model.AccountGroup, error) {
+	var group model.AccountGroup
+	err := s.db.WithContext(ctx).Where("is_default = ?", true).Order("id asc").First(&group).Error
+	return group, err
+}
+
+func (s *Store) FindAccountGroupsByIDs(ctx context.Context, ids []uint) ([]model.AccountGroup, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var rows []model.AccountGroup
+	err := s.db.WithContext(ctx).Unscoped().Where("id IN ?", ids).Find(&rows).Error
+	return rows, err
+}
+
+func (s *Store) SaveAccountGroup(ctx context.Context, group *model.AccountGroup) error {
+	return s.db.WithContext(ctx).Save(group).Error
+}
+
+func (s *Store) DeleteAccountGroup(ctx context.Context, id uint) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("group_id = ?", id).Delete(&model.AccountGroupMember{}).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&model.AccountGroup{}, id).Error
+	})
+}
+
+func (s *Store) ReassignAPIKeysToGroup(ctx context.Context, fromGroupID uint, toGroupID uint) error {
+	return s.db.WithContext(ctx).Model(&model.APIKey{}).Where("group_id = ?", fromGroupID).Update("group_id", &toGroupID).Error
+}
+
+func (s *Store) ListAccountGroupMembers(ctx context.Context, groupID uint) ([]model.AccountGroupMember, error) {
+	var rows []model.AccountGroupMember
+	err := s.db.WithContext(ctx).Where("group_id = ?", groupID).Order("priority desc, account_id asc").Find(&rows).Error
+	return rows, err
+}
+
+func (s *Store) ListAccountGroupMembersByAccountIDs(ctx context.Context, accountIDs []uint) ([]model.AccountGroupMember, error) {
+	if len(accountIDs) == 0 {
+		return nil, nil
+	}
+	var rows []model.AccountGroupMember
+	err := s.db.WithContext(ctx).Where("account_id IN ?", accountIDs).Order("group_id asc, account_id asc").Find(&rows).Error
+	return rows, err
+}
+
+func (s *Store) ReplaceAccountGroupMembers(ctx context.Context, groupID uint, members []model.AccountGroupMember) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("group_id = ?", groupID).Delete(&model.AccountGroupMember{}).Error; err != nil {
+			return err
+		}
+		for idx := range members {
+			members[idx].ID = 0
+			members[idx].GroupID = groupID
+			if err := tx.Create(&members[idx]).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Store) ReplaceAccountGroupBindings(ctx context.Context, accountID uint, members []model.AccountGroupMember) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("account_id = ?", accountID).Delete(&model.AccountGroupMember{}).Error; err != nil {
+			return err
+		}
+		for idx := range members {
+			members[idx].ID = 0
+			members[idx].AccountID = accountID
+			if err := tx.Create(&members[idx]).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Store) DeleteAccountGroupBindings(ctx context.Context, accountID uint) error {
+	return s.db.WithContext(ctx).Where("account_id = ?", accountID).Delete(&model.AccountGroupMember{}).Error
+}
+
+func (s *Store) EnsureAccountInDefaultGroup(ctx context.Context, account model.Account) error {
+	group, err := s.GetDefaultAccountGroup(ctx)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		group, err = s.EnsureDefaultAccountGroup(ctx)
+	}
+	if err != nil {
+		return err
+	}
+	member := model.AccountGroupMember{
+		GroupID:   group.ID,
+		AccountID: account.ID,
+		Enabled:   true,
+		Priority:  account.Priority,
+	}
+	return s.db.WithContext(ctx).Where("group_id = ? AND account_id = ?", group.ID, account.ID).FirstOrCreate(&member).Error
+}
+
+func (s *Store) FindAccountGroupMember(ctx context.Context, groupID uint, accountID uint) (model.AccountGroupMember, error) {
+	var member model.AccountGroupMember
+	err := s.db.WithContext(ctx).Where("group_id = ? AND account_id = ?", groupID, accountID).First(&member).Error
+	return member, err
 }
 
 func (s *Store) CountAdmins(ctx context.Context) (int64, error) {
@@ -238,6 +415,10 @@ func (s *Store) GetModelByPublicID(ctx context.Context, publicID string) (model.
 
 func (s *Store) ListAccounts(ctx context.Context, filter AccountFilter) ([]model.Account, error) {
 	query := s.db.WithContext(ctx).Model(&model.Account{})
+	if filter.GroupID != nil {
+		query = query.Joins("JOIN account_group_members ON account_group_members.account_id = accounts.id").
+			Where("account_group_members.group_id = ?", *filter.GroupID)
+	}
 	if !filter.IncludeDisabled {
 		query = query.Where("enabled = ?", true)
 	}
@@ -264,6 +445,27 @@ func (s *Store) GetAccountByEmail(ctx context.Context, email string) (model.Acco
 	var account model.Account
 	err := s.db.WithContext(ctx).Where("email = ?", email).First(&account).Error
 	return account, err
+}
+
+func (s *Store) GetAccountByEmailInGroup(ctx context.Context, groupID uint, email string) (model.Account, error) {
+	var account model.Account
+	err := s.db.WithContext(ctx).Model(&model.Account{}).
+		Joins("JOIN account_group_members ON account_group_members.account_id = accounts.id").
+		Where("account_group_members.group_id = ? AND account_group_members.enabled = ?", groupID, true).
+		Where("accounts.email = ?", email).
+		First(&account).Error
+	return account, err
+}
+
+func (s *Store) ListSchedulableAccountsByGroup(ctx context.Context, groupID uint) ([]model.Account, error) {
+	var rows []model.Account
+	err := s.db.WithContext(ctx).Model(&model.Account{}).
+		Joins("JOIN account_group_members ON account_group_members.account_id = accounts.id").
+		Where("account_group_members.group_id = ? AND account_group_members.enabled = ?", groupID, true).
+		Where("accounts.enabled = ?", true).
+		Order("account_group_members.priority desc, accounts.active desc, accounts.priority desc, accounts.last_used_at asc, accounts.id asc").
+		Find(&rows).Error
+	return rows, err
 }
 
 func (s *Store) FindActiveAccount(ctx context.Context) (model.Account, error) {

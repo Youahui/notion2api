@@ -66,6 +66,17 @@ func New(cfg config.Config, admins *service.AdminService, keys *service.APIKeySe
 			apiKeysGroup.DELETE("/:id", h.APIKeysDelete)
 		}
 
+		groupsGroup := admin.Group("/groups")
+		{
+			groupsGroup.GET("", h.GroupsList)
+			groupsGroup.POST("", h.GroupsCreate)
+			groupsGroup.GET("/:id", h.GroupsGet)
+			groupsGroup.PUT("/:id", h.GroupsUpdate)
+			groupsGroup.DELETE("/:id", h.GroupsDelete)
+			groupsGroup.GET("/:id/accounts", h.GroupMembers)
+			groupsGroup.PUT("/:id/accounts", h.GroupMembersUpdate)
+		}
+
 		modelsGroup := admin.Group("/models")
 		{
 			modelsGroup.GET("", h.AdminModels)

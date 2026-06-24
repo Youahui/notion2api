@@ -578,6 +578,9 @@ func (s *AccountService) saveLoginAccount(ctx context.Context, account model.Acc
 		if err := s.store.CreateAccount(ctx, &account); err != nil {
 			return model.Account{}, err
 		}
+		if err := s.store.EnsureAccountInDefaultGroup(ctx, account); err != nil {
+			return model.Account{}, err
+		}
 	} else if err := s.store.SaveAccount(ctx, &account); err != nil {
 		return model.Account{}, err
 	}

@@ -9,6 +9,7 @@ import {
   Empty,
   Flex,
   List,
+  Pagination,
   Popconfirm,
   Row,
   Select,
@@ -20,9 +21,17 @@ import {
 } from 'antd';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { adminApi } from '../../services/adminApi';
-import type { Account, AccountSpace, NotionConversationDetail, NotionConversationMessage, NotionConversationSummary } from '../../types/api';
+import type {
+  Account,
+  AccountSpace,
+  NotionConversationDetail,
+  NotionConversationMessage,
+  NotionConversationSummary,
+  PaginatedListResponse
+} from '../../types/api';
 
 const { Text, Title } = Typography;
+const defaultConversationPageSize = 10;
 
 function fmtTime(value?: string | null) {
   if (!value) return '-';
@@ -86,6 +95,10 @@ export function ConversationsPage() {
   const [spaces, setSpaces] = useState<AccountSpace[]>([]);
   const [rows, setRows] = useState<NotionConversationSummary[]>([]);
   const [detail, setDetail] = useState<NotionConversationDetail | null>(null);
+  const [conversationPage, setConversationPage] = useState(1);
+  const [conversationPageSize, setConversationPageSize] = useState(defaultConversationPageSize);
+  const [conversationTotal, setConversationTotal] = useState(0);
+  const [conversationHasMore, setConversationHasMore] = useState(false);
   const [selectedAccountID, setSelectedAccountID] = useState<number>();
   const [selectedSpaceID, setSelectedSpaceID] = useState('');
   const [selectedThreadID, setSelectedThreadID] = useState('');
@@ -97,10 +110,10 @@ export function ConversationsPage() {
   const [spacesError, setSpacesError] = useState('');
   const [remoteError, setRemoteError] = useState('');
   const [lastLoadedAt, setLastLoadedAt] = useState<string | null>(null);
-  const conversationCacheRef = useRef<Record<string, NotionConversationSummary[]>>({});
+  const conversationCacheRef = useRef<Record<string, PaginatedListResponse<NotionConversationSummary>>>({});
   const detailCacheRef = useRef<Record<string, NotionConversationDetail>>({});
   const spacesCacheRef = useRef<Record<number, AccountSpace[]>>({});
-  const listInFlightRef = useRef<Record<string, Promise<{ data: NotionConversationSummary[] }>>>({});
+  const listInFlightRef = useRef<Record<string, Promise<PaginatedListResponse<NotionConversationSummary>>>>({});
   const detailInFlightRef = useRef<Record<string, Promise<NotionConversationDetail>>>({});
   const spacesInFlightRef = useRef<Record<number, Promise<{ data: AccountSpace[] }>>>({});
   const listRequestRef = useRef(0);
@@ -123,10 +136,14 @@ export function ConversationsPage() {
     };
   }, [selectedAccount, selectedSpace, selectedSpaceID]);
 
-  const applyConversationRows = useCallback((items: NotionConversationSummary[]) => {
-    setRows(items);
-    setSelectedThreadID((current) => (current && items.some((row) => row.thread_id === current) ? current : ''));
-    if (!items.length) setDetail(null);
+  const applyConversationPage = useCallback((pageData: PaginatedListResponse<NotionConversationSummary>) => {
+    setRows(pageData.data);
+    setConversationPage(pageData.page);
+    setConversationPageSize(pageData.page_size);
+    setConversationTotal(pageData.total);
+    setConversationHasMore(pageData.has_more);
+    setSelectedThreadID((current) => (current && pageData.data.some((row) => row.thread_id === current) ? current : ''));
+    if (!pageData.data.length) setDetail(null);
   }, []);
 
   const loadAccounts = useCallback(async () => {
@@ -180,17 +197,22 @@ export function ConversationsPage() {
     }
   }, []);
 
-  const loadConversations = useCallback(async (force = false) => {
+  const loadConversations = useCallback(async (force = false, page = 1, pageSize = defaultConversationPageSize) => {
     const params = conversationParams();
-    const cacheKey = params ? `${params.account_id}:${params.space_id}` : '';
+    const targetKey = params ? `${params.account_id}:${params.space_id}` : '';
+    const cacheKey = targetKey ? `${targetKey}:${page}:${pageSize}` : '';
     if (!params) {
       setRows([]);
       setSelectedThreadID('');
       setDetail(null);
+      setConversationTotal(0);
+      setConversationHasMore(false);
       return;
     }
+    setConversationPage(page);
+    setConversationPageSize(pageSize);
     if (!force && conversationCacheRef.current[cacheKey]) {
-      applyConversationRows(conversationCacheRef.current[cacheKey]);
+      applyConversationPage(conversationCacheRef.current[cacheKey]);
     } else {
       setRows([]);
       setSelectedThreadID('');
@@ -202,18 +224,20 @@ export function ConversationsPage() {
     setRemoteError('');
     try {
       if (!listInFlightRef.current[cacheKey]) {
-        listInFlightRef.current[cacheKey] = adminApi.notionConversations({ ...params, limit: 50 });
+        listInFlightRef.current[cacheKey] = adminApi.notionConversations({ ...params, page, page_size: pageSize });
       }
       const res = await listInFlightRef.current[cacheKey];
       if (listRequestRef.current !== requestID) return;
-      conversationCacheRef.current[cacheKey] = res.data;
-      applyConversationRows(res.data);
+      conversationCacheRef.current[cacheKey] = res;
+      applyConversationPage(res);
       setLastLoadedAt(new Date().toISOString());
     } catch (error) {
       if (listRequestRef.current !== requestID) return;
       setRows([]);
       setSelectedThreadID('');
       setDetail(null);
+      setConversationTotal(0);
+      setConversationHasMore(false);
       setRemoteError(errorText(error, '加载 Notion 会话失败'));
     } finally {
       delete listInFlightRef.current[cacheKey];
@@ -221,7 +245,7 @@ export function ConversationsPage() {
         setLoadingConversations(false);
       }
     }
-  }, [applyConversationRows, conversationParams]);
+  }, [applyConversationPage, conversationParams]);
 
   useEffect(() => {
     void loadAccounts();
@@ -284,14 +308,19 @@ export function ConversationsPage() {
     try {
       await adminApi.deleteNotionConversation(threadID, params);
       const nextRows = rows.filter((row) => row.thread_id !== threadID);
-      const cacheKey = `${params.account_id}:${params.space_id}`;
-      conversationCacheRef.current[cacheKey] = nextRows;
-      delete detailCacheRef.current[`${cacheKey}:${threadID}`];
+      const targetKey = `${params.account_id}:${params.space_id}`;
+      Object.keys(conversationCacheRef.current).forEach((key) => {
+        if (key.startsWith(`${targetKey}:`)) delete conversationCacheRef.current[key];
+      });
+      delete detailCacheRef.current[`${targetKey}:${threadID}`];
       setRows(nextRows);
+      setConversationTotal((current) => Math.max(0, current - 1));
       if (selectedThreadID === threadID) {
         setSelectedThreadID('');
         setDetail(null);
       }
+      const nextPage = nextRows.length === 0 && conversationPage > 1 ? conversationPage - 1 : conversationPage;
+      await loadConversations(true, nextPage, conversationPageSize);
       message.success('Notion 会话已删除');
     } catch (error) {
       message.error(errorText(error, '删除 Notion 会话失败'));
@@ -301,10 +330,11 @@ export function ConversationsPage() {
   };
 
   const messages = detail?.messages || [];
+  const knownConversationTotal = Math.max(conversationTotal, rows.length);
   const overview = [
-    { label: '会话总数', value: rows.length, suffix: '条' },
+    { label: conversationHasMore ? '已知会话' : '会话总数', value: knownConversationTotal, suffix: conversationHasMore ? '条+' : '条' },
+    { label: '当前页', value: rows.length, suffix: '条' },
     { label: '消息数', value: messages.length, suffix: '条' },
-    { label: '账号数', value: accounts.length, suffix: '个' },
     { label: '工作区', value: spaces.length, suffix: '个' }
   ];
 
@@ -317,7 +347,12 @@ export function ConversationsPage() {
           </Title>
           <Text type="secondary">选择账号和工作区后，读取该 workspace 下的当前 Notion 会话列表。</Text>
         </div>
-        <Button icon={<ReloadOutlined />} loading={loadingConversations} disabled={!selectedAccount || !selectedSpaceID} onClick={() => void loadConversations()}>
+        <Button
+          icon={<ReloadOutlined />}
+          loading={loadingConversations}
+          disabled={!selectedAccount || !selectedSpaceID}
+          onClick={() => void loadConversations(true, conversationPage, conversationPageSize)}
+        >
           刷新会话
         </Button>
       </div>
@@ -373,35 +408,50 @@ export function ConversationsPage() {
                 当前会话列表
               </Space>
             }
-            extra={<Tag color="blue">{rows.length}</Tag>}
+            extra={<Tag color="blue">{`${rows.length}/${knownConversationTotal}`}</Tag>}
             className="conversations-fill-card"
           >
             <Spin spinning={loadingConversations}>
               {rows.length ? (
-                <List<NotionConversationSummary>
-                  dataSource={rows}
-                  renderItem={(item) => {
-                    const active = item.thread_id === selectedThreadID;
-                    return (
-                      <List.Item className="conversations-list-row">
-                        <button
-                          type="button"
-                          className={active ? 'conversation-list-item conversation-list-item-active' : 'conversation-list-item'}
-                          onClick={() => setSelectedThreadID(item.thread_id)}
-                        >
-                          <Flex justify="space-between" gap={12} align="start">
-                            <div className="conversation-list-title">{item.title || 'Untitled conversation'}</div>
-                            <Tag color={statusColor(item.status)}>{item.status || 'unknown'}</Tag>
-                          </Flex>
-                          <Flex justify="space-between" gap={12} className="conversation-list-meta">
-                            <Text type="secondary">{item.created_by_display_name || item.transport || 'transcript_sync'}</Text>
-                            <Text type="secondary">{fmtTime(item.updated_at || item.created_at)}</Text>
-                          </Flex>
-                        </button>
-                      </List.Item>
-                    );
-                  }}
-                />
+                <>
+                  <List<NotionConversationSummary>
+                    dataSource={rows}
+                    renderItem={(item) => {
+                      const active = item.thread_id === selectedThreadID;
+                      return (
+                        <List.Item className="conversations-list-row">
+                          <button
+                            type="button"
+                            className={active ? 'conversation-list-item conversation-list-item-active' : 'conversation-list-item'}
+                            onClick={() => setSelectedThreadID(item.thread_id)}
+                          >
+                            <Flex justify="space-between" gap={12} align="start">
+                              <div className="conversation-list-title">{item.title || 'Untitled conversation'}</div>
+                              <Tag color={statusColor(item.status)}>{item.status || 'unknown'}</Tag>
+                            </Flex>
+                            <Flex justify="space-between" gap={12} className="conversation-list-meta">
+                              <Text type="secondary">{item.created_by_display_name || item.transport || 'transcript_sync'}</Text>
+                              <Text type="secondary">{fmtTime(item.updated_at || item.created_at)}</Text>
+                            </Flex>
+                          </button>
+                        </List.Item>
+                      );
+                    }}
+                  />
+                  {knownConversationTotal > conversationPageSize ? (
+                    <Pagination
+                      className="conversations-list-pagination"
+                      current={conversationPage}
+                      pageSize={conversationPageSize}
+                      total={knownConversationTotal}
+                      pageSizeOptions={[10, 20, 50, 100]}
+                      showSizeChanger
+                      showTotal={(total, range) => `${range[0]}-${range[1]} / ${conversationHasMore ? `至少 ${total}` : total}`}
+                      size="small"
+                      onChange={(page, pageSize) => void loadConversations(false, page, pageSize)}
+                    />
+                  ) : null}
+                </>
               ) : (
                 <Empty description={selectedAccount && selectedSpaceID ? '当前工作区没有会话' : '先选择账号和工作区'} />
               )}

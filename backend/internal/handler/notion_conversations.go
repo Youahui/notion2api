@@ -18,12 +18,13 @@ func (h *Handler) NotionConversationsList(c *gin.Context) {
 	if !ok {
 		return
 	}
-	rows, err := h.notion.ListInferenceTranscripts(c.Request.Context(), account, spaceID, notionConversationLimit(c))
+	page, pageSize := notionConversationPagination(c)
+	rows, err := h.notion.ListInferenceTranscriptsPage(c.Request.Context(), account, spaceID, page, pageSize)
 	if err != nil {
 		handleNotionConversationError(c, err)
 		return
 	}
-	respond.JSON(c, http.StatusOK, gin.H{"data": rows})
+	respond.JSON(c, http.StatusOK, rows)
 }
 
 func (h *Handler) NotionConversationGet(c *gin.Context) {
@@ -89,19 +90,27 @@ func (h *Handler) notionConversationAccount(c *gin.Context) (model.Account, stri
 	return account, spaceID, true
 }
 
-func notionConversationLimit(c *gin.Context) int {
-	rawLimit := strings.TrimSpace(c.Query("limit"))
-	if rawLimit == "" {
-		return 50
+func notionConversationPagination(c *gin.Context) (int, int) {
+	page := positiveQueryInt(c, 1, "page")
+	pageSize := positiveQueryInt(c, 50, "page_size", "limit")
+	if pageSize > 100 {
+		pageSize = 100
 	}
-	limit, err := strconv.Atoi(rawLimit)
-	if err != nil || limit <= 0 {
-		return 50
+	return page, pageSize
+}
+
+func positiveQueryInt(c *gin.Context, fallback int, keys ...string) int {
+	for _, key := range keys {
+		raw := strings.TrimSpace(c.Query(key))
+		if raw == "" {
+			continue
+		}
+		value, err := strconv.Atoi(raw)
+		if err == nil && value > 0 {
+			return value
+		}
 	}
-	if limit > 100 {
-		return 100
-	}
-	return limit
+	return fallback
 }
 
 func firstQueryValue(c *gin.Context, keys ...string) string {
