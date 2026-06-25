@@ -1,25 +1,36 @@
 .DS_Store
+.idea/
 
 # Backend
+data/
 backend/data/
 backend/logs/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 backend/*.sqlite
 backend/*.sqlite-shm
 backend/*.sqlite-wal
 backend/tmp/
 backend/bin/
+backend/.idea/
 
 # Frontend
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
+frontend/.next/
+frontend/package-lock.json
 
 # Local env
 .env
 .env.local
+.env.*.local
 *.log
+
+# Notion login probes and browser states
+probe_files/
 
 # .md
 项目说明.md
 AGENTS.md
-

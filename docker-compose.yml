@@ -41,7 +41,7 @@ services:
     environment:
       POSTGRES_DB: notion2api
       POSTGRES_USER: notion2api
-      POSTGRES_PASSWORD: change-me
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
     volumes:
       - pg-data:/var/lib/postgresql/data
     ports:

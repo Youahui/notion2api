@@ -119,10 +119,10 @@ VITE_API_BASE_URL=http://127.0.0.1:9998 pnpm dev
 
 - 管理台：`http://127.0.0.1:5173/admin`
 - 默认管理员：`admin`
-- 示例配置默认密码：`change-me-please`
-- 示例配置默认 API Key：`<api_key>`
+- 示例配置初始密码：`change-me-please`
+- 示例配置默认不创建 API Key，请登录管理台后创建
 
-首次运行后请立即修改管理员密码，并重新创建自己的 API Key。
+首次运行前建议先修改示例配置或通过环境变量设置管理员密码；首次运行后请立即重新创建自己的 API Key。
 
 ### 方式二：Docker Compose
 
@@ -391,7 +391,7 @@ Codex 原生 Responses 请求会在本地兼容以下能力：
 | 配置项 | 本地开发示例 | Docker 示例 |
 | --- | --- | --- |
 | Base URL | `http://127.0.0.1:9998/v1` | `http://127.0.0.1:9998/v1` |
-| API Key | `<api_key>` | 你的 `N2A_BOOTSTRAP_API_KEY` 或管理台创建的 Key |
+| API Key | 管理台创建的 Key | 你的 `N2A_BOOTSTRAP_API_KEY` 或管理台创建的 Key |
 | Model | `auto` | `auto` 或 `/v1/models` 返回的模型 ID |
 
 调用失败时优先检查：后端端口、API Key 状态、Notion 账号是否已激活、账号是否有有效 Cookie / `token_v2`。
@@ -447,7 +447,7 @@ security:
   bootstrap_admin:
     username: admin
     password: change-me-please
-  bootstrap_api_key: "<api_key>"
+  bootstrap_api_key: ""
   api_key_prefix: "n2a"
 
 database:
@@ -618,7 +618,7 @@ pnpm build
 
 ### 账号与密钥
 
-- 不要使用示例管理员密码 `change-me-please`。
+- 不要使用示例管理员密码。
 - 不要在公开仓库提交真实 `token_v2`、Cookie、API Key 或管理员 Token。
 - 首次启动后立即修改管理员密码。
 - 为不同调用方创建不同 API Key，便于额度控制和审计。
